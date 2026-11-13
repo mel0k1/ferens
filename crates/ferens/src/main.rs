@@ -134,8 +134,12 @@ fn dispatch_mmio_live() -> io::Result<()> {
     let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
     let mut queue = CpQueue::create(&slot_dir, device.chip)?;
     println!(
-        "mec fw 0x{:08x}, mec2 {}, ring {} dwords, queue me1 pipe0 queue0, doorbell slot {:#x}",
-        queue.mec_fw_version, queue.mec2_loaded, queue.ring_dw, queue.doorbell_index
+        "mec fw 0x{:08x}, rlc fw 0x{:08x}, mec2 {}, ring {} dwords, queue me1 pipe0 queue0, doorbell slot {:#x}",
+        queue.mec_fw_version,
+        queue.rlc_fw_version,
+        queue.mec2_loaded,
+        queue.ring_dw,
+        queue.doorbell_index
     );
     queue.load_kernel(&isa::KERNEL_WORDS)?;
     let stream = queue.dispatch_stream([1, 1, 1], [64, 1, 1]);

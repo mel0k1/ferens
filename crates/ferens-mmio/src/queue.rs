@@ -12,8 +12,9 @@ use ferens_gfx8::pm4::PacketBuilder;
 use ferens_gfx8::regs;
 use ferens_gfx8::ring::write_packet;
 
-use crate::fw::{self, MecFirmwareSet};
+use crate::fw::{self, FirmwareSet};
 use crate::hqd;
+use crate::rlc;
 use crate::vm;
 
 pub const VRAM_BASE: u64 = 0x0400_0000;
@@ -39,6 +40,7 @@ pub struct CpQueue {
     regs: Mmio<MappedBar>,
     aperture: MappedBar,
     pub mec_fw_version: u32,
+    pub rlc_fw_version: u32,
     pub mec2_loaded: bool,
     pub ring_dw: usize,
     pub doorbell_index: u32,
@@ -106,6 +108,7 @@ impl CpQueue {
             regs,
             aperture,
             mec_fw_version: firmware.mec1.version,
+            rlc_fw_version: firmware.rlc.version,
             mec2_loaded: firmware.mec2.is_some(),
             ring_dw: RING_BYTES / 4,
             doorbell_index: hqd::DOORBELL_INDEX,
@@ -116,7 +119,8 @@ impl CpQueue {
         Ok(queue)
     }
 
-    fn bring_up(&mut self, firmware: MecFirmwareSet) -> io::Result<()> {
+    fn bring_up(&mut self, firmware: FirmwareSet) -> io::Result<()> {
+        rlc::resume(&self.regs, &firmware.rlc);
         self.regs.write_reg_direct(
             hqd::CP_MEC_CNTL,
             hqd::CP_MEC_CNTL_ME1_HALT | hqd::CP_MEC_CNTL_ME2_HALT,
@@ -156,7 +160,7 @@ impl CpQueue {
         Ok(())
     }
 
-    fn load_mec(&mut self, addr_reg: u32, data_reg: u32, firmware: &fw::MecFirmware) {
+    fn load_mec(&mut self, addr_reg: u32, data_reg: u32, firmware: &fw::UcodeFirmware) {
         self.regs.write_reg_direct(addr_reg, 0);
         for word in &firmware.words {
             self.regs.write_reg_direct(data_reg, *word);
@@ -387,6 +391,7 @@ impl CpQueue {
             hqd::CP_MEC_CNTL,
             hqd::CP_MEC_CNTL_ME1_HALT | hqd::CP_MEC_CNTL_ME2_HALT,
         );
+        rlc::stop(&self.regs);
         self.destroyed = true;
         result
     }

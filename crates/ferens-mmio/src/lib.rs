@@ -1,9 +1,12 @@
 pub mod fw;
 pub mod hqd;
 pub mod queue;
+pub mod rlc;
 pub mod vm;
 
-pub use fw::{load, parse_gfx_firmware, MecFirmware, MecFirmwareSet, FIRMWARE_DIR};
+pub use fw::{
+    load, parse_gfx_firmware, parse_rlc_firmware, FirmwareSet, UcodeFirmware, FIRMWARE_DIR,
+};
 pub use hqd::{
     doorbell_control, persistent_state, pq_base_hi_word, pq_base_word, pq_control, quantum,
     srbm_gfx_cntl, CP_HQD_ACTIVE, CP_HQD_PQ_BASE, CP_HQD_PQ_CONTROL, CP_MEC_CNTL,

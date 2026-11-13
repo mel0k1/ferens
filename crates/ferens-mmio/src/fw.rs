@@ -7,22 +7,25 @@ use ferens_core::Chip;
 pub const FIRMWARE_DIR: &str = "/lib/firmware/amdgpu";
 pub const FIRMWARE_DIR_ALT: &str = "/usr/lib/firmware/amdgpu";
 
-const HEADER_VERSION_MAJOR: u16 = 1;
+const GFX_HEADER_VERSION_MAJOR: u16 = 1;
+const RLC_HEADER_VERSION_MAJORS: [u16; 2] = [1, 2];
 const HEADER_MIN_BYTES: usize = 0x2C;
+const HEADER_VERSION_OFFSET: usize = 0x08;
 const UCODE_VERSION_OFFSET: usize = 0x10;
 const UCODE_SIZE_OFFSET: usize = 0x14;
 const UCODE_ARRAY_OFFSET: usize = 0x18;
 const FEATURE_VERSION_OFFSET: usize = 0x20;
 
-pub struct MecFirmware {
+pub struct UcodeFirmware {
     pub version: u32,
     pub feature_version: u32,
     pub words: Vec<u32>,
 }
 
-pub struct MecFirmwareSet {
-    pub mec1: MecFirmware,
-    pub mec2: Option<MecFirmware>,
+pub struct FirmwareSet {
+    pub mec1: UcodeFirmware,
+    pub mec2: Option<UcodeFirmware>,
+    pub rlc: UcodeFirmware,
 }
 
 pub fn chip_prefix(chip: Chip) -> io::Result<&'static str> {
@@ -51,14 +54,14 @@ fn read_word(data: &[u8], offset: usize) -> io::Result<u32> {
     ]))
 }
 
-pub fn parse_gfx_firmware(data: &[u8]) -> io::Result<MecFirmware> {
+fn parse_ucode(data: &[u8], header_majors: &[u16]) -> io::Result<UcodeFirmware> {
     let header_size = read_word(data, 0x04)? as usize;
-    let version_major = u16::from_le_bytes([data[8], data[9]]);
+    let version_major = read_word(data, HEADER_VERSION_OFFSET)? as u16;
     let version = read_word(data, UCODE_VERSION_OFFSET)?;
     let ucode_size = read_word(data, UCODE_SIZE_OFFSET)? as usize;
     let array_offset = read_word(data, UCODE_ARRAY_OFFSET)? as usize;
     let feature_version = read_word(data, FEATURE_VERSION_OFFSET)?;
-    if version_major != HEADER_VERSION_MAJOR {
+    if !header_majors.contains(&version_major) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported firmware header version",
@@ -83,38 +86,63 @@ pub fn parse_gfx_firmware(data: &[u8]) -> io::Result<MecFirmware> {
     for index in 0..ucode_size / 4 {
         words.push(read_word(data, array_offset + index * 4)?);
     }
-    Ok(MecFirmware {
+    Ok(UcodeFirmware {
         version,
         feature_version,
         words,
     })
 }
 
+pub fn parse_gfx_firmware(data: &[u8]) -> io::Result<UcodeFirmware> {
+    parse_ucode(data, &[GFX_HEADER_VERSION_MAJOR])
+}
+
+pub fn parse_rlc_firmware(data: &[u8]) -> io::Result<UcodeFirmware> {
+    parse_ucode(data, &RLC_HEADER_VERSION_MAJORS)
+}
+
+type ParseFn = fn(&[u8]) -> io::Result<UcodeFirmware>;
+
 fn firmware_path(dir: &Path, prefix: &str, suffix: &str) -> io::Result<Vec<u8>> {
     let path = dir.join(format!("{prefix}_{suffix}.bin"));
     fs::read(&path).map_err(|error| io::Error::other(format!("{}: {error}", path.display())))
 }
 
-fn load_one(dir: &Path, prefix: &str, suffix: &str) -> io::Result<MecFirmware> {
+fn load_file(dir: &Path, prefix: &str, suffix: &str, parse: ParseFn) -> io::Result<UcodeFirmware> {
     let data = firmware_path(dir, prefix, suffix)?;
-    parse_gfx_firmware(&data)
+    parse(&data)
 }
 
-pub fn load(chip: Chip) -> io::Result<MecFirmwareSet> {
-    let prefix = chip_prefix(chip)?;
-    let dir = Path::new(FIRMWARE_DIR);
-    let dir_alt = Path::new(FIRMWARE_DIR_ALT);
-    let mec1 = load_one(dir, prefix, "mec").or_else(|error| {
-        if dir_alt.join(format!("{prefix}_mec.bin")).exists() {
-            load_one(dir_alt, prefix, "mec")
+fn load_required(
+    dir: &Path,
+    dir_alt: &Path,
+    prefix: &str,
+    suffix: &str,
+    parse: ParseFn,
+) -> io::Result<UcodeFirmware> {
+    load_file(dir, prefix, suffix, parse).or_else(|error| {
+        if dir_alt.join(format!("{prefix}_{suffix}.bin")).exists() {
+            load_file(dir_alt, prefix, suffix, parse)
         } else {
             Err(error)
         }
-    })?;
-    let mec2 = load_one(dir, prefix, "mec2")
+    })
+}
+
+fn load_optional(dir: &Path, dir_alt: &Path, prefix: &str, suffix: &str) -> Option<UcodeFirmware> {
+    load_file(dir, prefix, suffix, parse_gfx_firmware)
         .ok()
-        .or_else(|| load_one(dir_alt, prefix, "mec2").ok());
-    Ok(MecFirmwareSet { mec1, mec2 })
+        .or_else(|| load_file(dir_alt, prefix, suffix, parse_gfx_firmware).ok())
+}
+
+pub fn load(chip: Chip) -> io::Result<FirmwareSet> {
+    let prefix = chip_prefix(chip)?;
+    let dir = Path::new(FIRMWARE_DIR);
+    let dir_alt = Path::new(FIRMWARE_DIR_ALT);
+    let mec1 = load_required(dir, dir_alt, prefix, "mec", parse_gfx_firmware)?;
+    let mec2 = load_optional(dir, dir_alt, prefix, "mec2");
+    let rlc = load_required(dir, dir_alt, prefix, "rlc", parse_rlc_firmware)?;
+    Ok(FirmwareSet { mec1, mec2, rlc })
 }
 
 #[cfg(test)]
@@ -124,7 +152,7 @@ mod tests {
     fn header_bytes(ucode: &[u32], header_size: usize) -> Vec<u8> {
         let mut data = vec![0u8; header_size];
         data[0x04..0x08].copy_from_slice(&(header_size as u32).to_le_bytes());
-        data[0x08..0x0A].copy_from_slice(&HEADER_VERSION_MAJOR.to_le_bytes());
+        data[0x08..0x0A].copy_from_slice(&GFX_HEADER_VERSION_MAJOR.to_le_bytes());
         data[0x0A..0x0C].copy_from_slice(&0u16.to_le_bytes());
         data[UCODE_VERSION_OFFSET..UCODE_VERSION_OFFSET + 4]
             .copy_from_slice(&0x0001_0203u32.to_le_bytes());
@@ -134,6 +162,26 @@ mod tests {
             .copy_from_slice(&(header_size as u32).to_le_bytes());
         data[FEATURE_VERSION_OFFSET..FEATURE_VERSION_OFFSET + 4]
             .copy_from_slice(&0x0000_0042u32.to_le_bytes());
+        for word in ucode {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        data
+    }
+
+    fn rlc_header_bytes(ucode: &[u32]) -> Vec<u8> {
+        let header_size = 0x68usize;
+        let array_offset = 0x100usize;
+        let mut data = vec![0u8; array_offset];
+        data[0x04..0x08].copy_from_slice(&(header_size as u32).to_le_bytes());
+        data[0x08..0x0A].copy_from_slice(&2u16.to_le_bytes());
+        data[UCODE_VERSION_OFFSET..UCODE_VERSION_OFFSET + 4]
+            .copy_from_slice(&0x11Eu32.to_le_bytes());
+        data[UCODE_SIZE_OFFSET..UCODE_SIZE_OFFSET + 4]
+            .copy_from_slice(&((ucode.len() * 4) as u32).to_le_bytes());
+        data[UCODE_ARRAY_OFFSET..UCODE_ARRAY_OFFSET + 4]
+            .copy_from_slice(&(array_offset as u32).to_le_bytes());
+        data[FEATURE_VERSION_OFFSET..FEATURE_VERSION_OFFSET + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
         for word in ucode {
             data.extend_from_slice(&word.to_le_bytes());
         }
@@ -175,6 +223,48 @@ mod tests {
         let mut data = header_bytes(&[1], 0x2C);
         data[UCODE_ARRAY_OFFSET..UCODE_ARRAY_OFFSET + 4].copy_from_slice(&0x1000u32.to_le_bytes());
         assert!(parse_gfx_firmware(&data).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_oversized_header() {
+        let data = header_bytes(&[1], 0x2C);
+        let mut truncated = data[..0x20].to_vec();
+        truncated.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(parse_gfx_firmware(&truncated).is_err());
+    }
+
+    #[test]
+    fn parse_rlc_accepts_v2_header_like_polaris_bins() {
+        let data = rlc_header_bytes(&[0xBEEF_0001, 0xBEEF_0002]);
+        let firmware = parse_rlc_firmware(&data).unwrap();
+        assert_eq!(firmware.version, 0x11E);
+        assert_eq!(firmware.feature_version, 1);
+        assert_eq!(firmware.words, vec![0xBEEF_0001, 0xBEEF_0002]);
+    }
+
+    #[test]
+    fn parse_rlc_accepts_v1_header() {
+        let data = header_bytes(&[7], 0x34);
+        assert!(parse_rlc_firmware(&data).is_ok());
+    }
+
+    #[test]
+    fn parse_rlc_rejects_unknown_header_version() {
+        let mut data = rlc_header_bytes(&[1]);
+        data[8] = 3;
+        assert!(parse_rlc_firmware(&data).is_err());
+    }
+
+    #[test]
+    fn parse_gfx_rejects_rlc_v2_header() {
+        let data = rlc_header_bytes(&[1]);
+        assert!(parse_gfx_firmware(&data).is_err());
+    }
+
+    #[test]
+    fn parse_rlc_rejects_truncated_payload() {
+        let data = rlc_header_bytes(&[1, 2, 3]);
+        assert!(parse_rlc_firmware(&data[..data.len() - 4]).is_err());
     }
 
     #[test]
