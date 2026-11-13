@@ -9,3 +9,5 @@ repository.workspace = true
 [dependencies]
 ferens-core = { path = "../ferens-core" }
 ferens-gfx8 = { path = "../ferens-gfx8" }
+ferens-kfd = { path = "../ferens-kfd" }
+libc.workspace = true
