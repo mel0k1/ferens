@@ -1,0 +1,11 @@
+[package]
+name = "ferens"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferens-core = { path = "../ferens-core" }
+ferens-gfx8 = { path = "../ferens-gfx8" }
