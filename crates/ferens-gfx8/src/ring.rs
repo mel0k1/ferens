@@ -1,8 +1,25 @@
 use crate::pm4::NOP_WORD;
 
+pub const PACKET_NOP: u32 = NOP_WORD;
+
 pub struct Ring {
     words: Vec<u32>,
     write_dw: usize,
+}
+
+pub fn write_packet(ring: &mut [u32], wp: usize, packet: &[u32]) -> Option<usize> {
+    if packet.is_empty() || packet.len() > ring.len() {
+        return None;
+    }
+    let mut wp = wp;
+    if ring.len() - wp < packet.len() {
+        for word in &mut ring[wp..] {
+            *word = PACKET_NOP;
+        }
+        wp = 0;
+    }
+    ring[wp..wp + packet.len()].copy_from_slice(packet);
+    Some((wp + packet.len()) % ring.len())
 }
 
 impl Ring {
@@ -84,5 +101,29 @@ mod tests {
         let mut ring = Ring::new(8).unwrap();
         assert!(!ring.emit(&[0; 9]));
         assert!(!ring.emit(&[]));
+    }
+
+    #[test]
+    fn write_packet_fills_wrap_with_nops() {
+        let mut ring = [0u32; 8];
+        assert_eq!(write_packet(&mut ring, 0, &[1, 2, 3, 4, 5, 6]), Some(6));
+        assert_eq!(write_packet(&mut ring, 6, &[7, 8, 9]), Some(3));
+        assert_eq!(ring[6], PACKET_NOP);
+        assert_eq!(ring[7], PACKET_NOP);
+        assert_eq!(ring[..3], [7, 8, 9]);
+    }
+
+    #[test]
+    fn write_packet_rejects_oversized_and_empty() {
+        let mut ring = [0u32; 4];
+        assert!(write_packet(&mut ring, 0, &[0; 5]).is_none());
+        assert!(write_packet(&mut ring, 0, &[]).is_none());
+    }
+
+    #[test]
+    fn write_packet_exact_fit_wraps_to_zero() {
+        let mut ring = [0u32; 4];
+        assert_eq!(write_packet(&mut ring, 0, &[1, 2, 3, 4]), Some(0));
+        assert_eq!(ring, [1, 2, 3, 4]);
     }
 }

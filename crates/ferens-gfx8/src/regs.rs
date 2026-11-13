@@ -20,10 +20,15 @@ pub const COMPUTE_PGM_LO: u32 = 0x2E0C;
 pub const COMPUTE_PGM_HI: u32 = 0x2E0D;
 pub const COMPUTE_PGM_RSRC1: u32 = 0x2E12;
 pub const COMPUTE_PGM_RSRC2: u32 = 0x2E13;
+pub const COMPUTE_STATIC_THREAD_MGMT_SE0: u32 = 0x2E16;
+pub const COMPUTE_STATIC_THREAD_MGMT_SE1: u32 = 0x2E17;
+pub const COMPUTE_STATIC_THREAD_MGMT_SE2: u32 = 0x2E19;
+pub const COMPUTE_STATIC_THREAD_MGMT_SE3: u32 = 0x2E1A;
 pub const COMPUTE_USER_DATA_0: u32 = 0x2E40;
 pub const COMPUTE_USER_DATA_15: u32 = 0x2E4F;
 
 pub const DISPATCH_SHADER_EN: u32 = 1 << 0;
+pub const STATIC_THREAD_MGMT_ALL: u32 = 0xFFFF_FFFF;
 
 pub fn sh_offset(mm_offset: u32) -> u32 {
     mm_offset - SET_SH_REG_START

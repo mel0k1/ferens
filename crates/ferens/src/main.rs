@@ -13,8 +13,9 @@ use ferens_gfx8::isa;
 use ferens_gfx8::pm4::PacketBuilder;
 use ferens_gfx8::regs;
 use ferens_kfd::{Allocator, ComputeQueue, Device, GPU_PAGE_BYTES};
+use ferens_mmio::CpQueue;
 
-const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch";
+const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio";
 
 const RING_BYTES: usize = 4096;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +27,7 @@ fn main() {
         Some("show") => run_show(args.get(1).map(String::as_str)),
         Some("pm4-dump") => run_pm4_dump(),
         Some("dispatch") => run_dispatch(),
+        Some("dispatch-mmio") => run_dispatch_mmio(),
         _ => eprintln!("{USAGE}"),
     }
 }
@@ -65,8 +67,8 @@ fn run_show(slot: Option<&str>) {
         eprintln!("{slot} is not an AMD GPU on this system");
         return;
     };
-    let Some(bar) = device.mmio_bar() else {
-        eprintln!("{slot} has no memory bar 0");
+    let Some(bar) = device.regs_bar() else {
+        eprintln!("{slot} has no memory bar");
         return;
     };
     let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(slot);
@@ -112,6 +114,49 @@ fn run_dispatch() {
     if let Err(error) = dispatch_live() {
         eprintln!("dispatch failed: {error}");
     }
+}
+
+fn run_dispatch_mmio() {
+    if let Err(error) = dispatch_mmio_live() {
+        eprintln!("dispatch-mmio failed: {error}");
+    }
+}
+
+fn dispatch_mmio_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let mut queue = CpQueue::create(&slot_dir, device.chip)?;
+    println!(
+        "mec fw 0x{:08x}, mec2 {}, ring {} dwords, queue me1 pipe0 queue0, doorbell slot {:#x}",
+        queue.mec_fw_version, queue.mec2_loaded, queue.ring_dw, queue.doorbell_index
+    );
+    queue.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = queue.dispatch_stream([1, 1, 1], [64, 1, 1]);
+    println!("stream {} dwords", stream.len());
+    queue.submit(&stream)?;
+
+    let started = Instant::now();
+    let fence = queue.wait_fence(FENCE_TIMEOUT)?;
+    println!("fence {fence:#x} after {}ms", started.elapsed().as_millis());
+    println!(
+        "data[0] {:#010x}, kernel writes {:#010x}",
+        queue.meta_u32(OUTPUT_OFFSET),
+        isa::KERNEL_MAGIC
+    );
+    println!(
+        "ring: wp {} dwords, rptr report {} dwords",
+        queue.write_pointer_dw(),
+        queue.read_pointer_dw()
+    );
+    queue.destroy()?;
+    Ok(())
 }
 
 fn dispatch_live() -> io::Result<()> {

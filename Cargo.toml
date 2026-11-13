@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ferens", "crates/ferens-core", "crates/ferens-gfx8", "crates/ferens-kfd"]
+members = ["crates/ferens", "crates/ferens-core", "crates/ferens-gfx8", "crates/ferens-kfd", "crates/ferens-mmio"]
 
 [workspace.package]
 version = "0.1.0"

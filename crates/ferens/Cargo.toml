@@ -10,4 +10,5 @@ repository.workspace = true
 ferens-core = { path = "../ferens-core" }
 ferens-gfx8 = { path = "../ferens-gfx8" }
 ferens-kfd = { path = "../ferens-kfd" }
+ferens-mmio = { path = "../ferens-mmio" }
 libc.workspace = true

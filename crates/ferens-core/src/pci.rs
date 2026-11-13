@@ -61,8 +61,45 @@ pub struct PciDevice {
 }
 
 impl PciDevice {
-    pub fn mmio_bar(&self) -> Option<&BarInfo> {
-        self.bars.iter().find(|bar| bar.memory && bar.index == 0)
+    pub fn from_sysfs(dir: &Path) -> io::Result<Self> {
+        let vendor_id = read_hex_file(dir, "vendor")?;
+        if vendor_id != u64::from(PCI_VENDOR_AMD) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "device is not AMD",
+            ));
+        }
+        let device_id = read_hex_file(dir, "device")?;
+        let revision = fs::read_to_string(dir.join("revision"))
+            .ok()
+            .and_then(|text| parse_hex(&text))
+            .unwrap_or(0);
+        let resource_text = fs::read_to_string(dir.join("resource")).unwrap_or_default();
+        Ok(PciDevice {
+            slot: dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            vendor_id: PCI_VENDOR_AMD,
+            device_id: device_id as u16,
+            revision: revision as u8,
+            chip: Chip::from_device_id(device_id as u16),
+            bars: parse_resource(&resource_text),
+        })
+    }
+
+    pub fn regs_bar(&self) -> Option<&BarInfo> {
+        self.bars
+            .iter()
+            .filter(|bar| bar.memory)
+            .min_by_key(|bar| bar.size)
+    }
+
+    pub fn aperture_bar(&self) -> Option<&BarInfo> {
+        self.bars
+            .iter()
+            .filter(|bar| bar.memory)
+            .max_by_key(|bar| bar.size)
     }
 }
 
@@ -108,22 +145,7 @@ pub fn scan_dir(dir: &Path) -> io::Result<Vec<PciDevice>> {
         if read_hex_file(&path, "vendor")? != u64::from(PCI_VENDOR_AMD) {
             continue;
         }
-        let device_id = read_hex_file(&path, "device")?;
-        let revision = fs::read_to_string(path.join("revision"))
-            .ok()
-            .and_then(|text| parse_hex(&text))
-            .unwrap_or(0);
-        let resource_text = fs::read_to_string(path.join("resource")).unwrap_or_default();
-        let bars = parse_resource(&resource_text);
-        let slot = entry.file_name().into_string().unwrap_or_default();
-        devices.push(PciDevice {
-            slot,
-            vendor_id: PCI_VENDOR_AMD,
-            device_id: device_id as u16,
-            revision: revision as u8,
-            chip: Chip::from_device_id(device_id as u16),
-            bars,
-        });
+        devices.push(PciDevice::from_sysfs(&path)?);
     }
     devices.sort_by(|a, b| a.slot.cmp(&b.slot));
     Ok(devices)
@@ -179,6 +201,17 @@ mod tests {
         assert_eq!(devices[0].slot, "0000:01:00.0");
         assert_eq!(devices[0].chip, Chip::Polaris10);
         assert_eq!(devices[0].revision, 0xe7);
-        assert_eq!(devices[0].mmio_bar().unwrap().size, 0x100000);
+        assert_eq!(devices[0].regs_bar().unwrap().size, 0x100000);
+        assert_eq!(devices[0].aperture_bar().unwrap().size, 0x10000000);
+    }
+
+    #[test]
+    fn from_sysfs_rejects_non_amd_vendor() {
+        let dir = std::env::temp_dir().join(format!("ferens-vendor-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("vendor"), "0x8086\n").unwrap();
+        fs::write(dir.join("device"), "0x1234\n").unwrap();
+        assert!(PciDevice::from_sysfs(&dir).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

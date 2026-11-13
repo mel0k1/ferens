@@ -53,6 +53,16 @@ impl MappedBar {
             bytes,
         })
     }
+
+    pub fn words(&self) -> &[u32] {
+        assert!(self.bytes.is_multiple_of(4), "bar size is not word aligned");
+        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u32>(), self.bytes / 4) }
+    }
+
+    pub fn words_mut(&mut self) -> &mut [u32] {
+        assert!(self.bytes.is_multiple_of(4), "bar size is not word aligned");
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast::<u32>(), self.bytes / 4) }
+    }
 }
 
 impl BarOps for MappedBar {
@@ -121,10 +131,19 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let bar = MappedBar::mmap(file, 64).unwrap();
+        let mut bar = MappedBar::mmap(file, 64).unwrap();
         bar.write_u32(8, 0x1234_5678);
         assert_eq!(bar.read_u32(8), 0x1234_5678);
         assert_eq!(bar.size(), 64);
+        {
+            let words = bar.words();
+            assert_eq!(words[2], 0x1234_5678);
+        }
+        {
+            let words = bar.words_mut();
+            words[3] = 0xCAFE_F00D;
+        }
+        assert_eq!(bar.read_u32(12), 0xCAFE_F00D);
         std::fs::remove_file(&path).unwrap();
     }
 

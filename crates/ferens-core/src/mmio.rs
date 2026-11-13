@@ -29,6 +29,14 @@ impl<B: BarOps> Mmio<B> {
         self.bar.write_u32(MM_INDEX_BYTE_OFFSET, offset);
         self.bar.write_u32(MM_DATA_BYTE_OFFSET, value);
     }
+
+    pub fn read_reg_direct(&self, offset: u32) -> u32 {
+        self.bar.read_u32(offset as usize * 4)
+    }
+
+    pub fn write_reg_direct(&self, offset: u32, value: u32) {
+        self.bar.write_u32(offset as usize * 4, value);
+    }
 }
 
 #[cfg(test)]
@@ -81,5 +89,16 @@ mod tests {
         mmio.bar().cells.borrow_mut()[1] = 0xABCD_1234;
         assert_eq!(mmio.read_reg(0x150A), 0xABCD_1234);
         assert_eq!(mmio.bar().writes.borrow().as_slice(), &[(0x0, 0x150A)]);
+    }
+
+    #[test]
+    fn direct_access_multiplies_offset_by_word_size() {
+        let mmio = Mmio::new(FakeBar::new(4));
+        mmio.bar().cells.borrow_mut()[2] = 0x55;
+        assert_eq!(mmio.read_reg_direct(2), 0x55);
+        assert_eq!(mmio.bar().writes.borrow().as_slice(), &[]);
+        mmio.write_reg_direct(3, 0x5C);
+        assert_eq!(mmio.bar().cells.borrow()[3], 0x5C);
+        assert_eq!(mmio.bar().writes.borrow().as_slice(), &[(0xC, 0x5C)]);
     }
 }
