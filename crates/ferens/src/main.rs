@@ -13,9 +13,9 @@ use ferens_gfx8::isa;
 use ferens_gfx8::pm4::PacketBuilder;
 use ferens_gfx8::regs;
 use ferens_kfd::{Allocator, ComputeQueue, Device, GPU_PAGE_BYTES};
-use ferens_mmio::CpQueue;
+use ferens_mmio::{CpQueue, Sdma};
 
-const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens status";
+const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens status | ferens sdma-copy [bytes]";
 
 const RING_BYTES: usize = 4096;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,6 +31,7 @@ fn main() {
         Some("gate") => run_gate(args.get(1).map(String::as_str)),
         Some("dispatch-gtt") => run_dispatch_gtt(),
         Some("status") => run_status(),
+        Some("sdma-copy") => run_sdma_copy(args.get(1).map(String::as_str)),
         _ => eprintln!("{USAGE}"),
     }
 }
@@ -141,6 +142,80 @@ fn run_status() {
     if let Err(error) = status_live() {
         eprintln!("status failed: {error}");
     }
+}
+
+fn run_sdma_copy(arg: Option<&str>) {
+    if let Err(error) = sdma_copy_live(arg) {
+        eprintln!("sdma-copy failed: {error}");
+    }
+}
+
+fn sdma_copy_live(arg: Option<&str>) -> io::Result<()> {
+    let bytes: usize = match arg {
+        Some(text) => text.parse().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "byte count must be a number")
+        })?,
+        None => 4096,
+    };
+    if bytes == 0 || bytes > ferens_mmio::COPY_COUNT_MAX || !bytes.is_multiple_of(4) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "byte count must be a multiple of 4 in 4..0x3fffff",
+        ));
+    }
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let mut sdma = Sdma::open(&slot_dir, device.chip)?;
+    println!(
+        "sdma fw {:#08x} / {:#08x}, rings 2x{} bytes in vram, kick via mmio wptr",
+        sdma.fw_versions[0],
+        sdma.fw_versions[1],
+        ferens_mmio::queue::SDMA_RING_BYTES
+    );
+    let pages = bytes.div_ceil(GPU_PAGE_BYTES);
+    let src = sdma.alloc_gtt(pages)?;
+    let dst = sdma.alloc_gtt(pages)?;
+    for index in 0..bytes / 4 {
+        src.host
+            .write_u32(index * 4, (index as u32).wrapping_mul(0x9e37_79b1) | 1);
+    }
+    let scratch = ferens_mmio::sdma::scratch_va();
+    println!(
+        "gtt src {:#x}, dst {:#x}, vram scratch {:#x}",
+        src.va, dst.va, scratch
+    );
+    sdma.copy(scratch, src.va, bytes)?;
+    println!(
+        "copy gtt->vram done, rptr {} dwords",
+        sdma.read_pointer_dw(0)
+    );
+    sdma.copy(dst.va, scratch, bytes)?;
+    println!(
+        "copy vram->gtt done, rptr {} dwords",
+        sdma.read_pointer_dw(0)
+    );
+    for index in 0..bytes / 4 {
+        let expected = src.host.read_u32(index * 4);
+        let actual = dst.host.read_u32(index * 4);
+        if expected != actual {
+            let report = sdma.status(0).report();
+            sdma.destroy()?;
+            return Err(io::Error::other(format!(
+                "mismatch at dword {index}: want {expected:#010x}, got {actual:#010x}\n{report}"
+            )));
+        }
+    }
+    println!("verify ok: {bytes} bytes roundtripped through vram");
+    println!("{}", sdma.status(0).report());
+    sdma.destroy()?;
+    Ok(())
 }
 
 fn status_live() -> io::Result<()> {

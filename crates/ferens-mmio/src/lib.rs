@@ -11,6 +11,7 @@ pub mod iommu;
 pub mod power;
 pub mod queue;
 pub mod rlc;
+pub mod sdma;
 pub mod vm;
 
 pub use fault::{snapshot, Status};
@@ -36,6 +37,7 @@ pub use queue::{
     PTE_TABLE_OFFSET, RING_BYTES, RING_OFFSET, VM_WINDOW_BYTES, VRAM_BASE,
 };
 pub use rlc::{RLC_CGCG_CGLS_CTRL, RLC_CGCG_CGLS_CTRL_3D, RLC_CNTL, RLC_PG_CNTL};
+pub use sdma::{copy_packet, fence_packet, Sdma, SdmaStatus, COPY_COUNT_MAX, FENCE_TIMEOUT};
 pub use vm::{
     fill_identity_table, program_context0, program_l1_l2, pte_identity_word, pte_system_word,
     VmConfig, GPU_PAGE_BYTES, PTE_FLAGS, PTE_SYSTEM,

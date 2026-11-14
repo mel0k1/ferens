@@ -18,7 +18,7 @@
 - [x] MEC1/MEC2 ucode, CP_HQD через MMIO, doorbell, PM4 dispatch, fence polling
 - [x] GTT: identity-окно VRAM + системные PTE из /proc/self/pagemap, alloc_gtt
 - [ ] GFX ucode (PFP/ME/CE) и gfx ring — для compute не нужен, нужен для графики
-- [ ] SDMA ucode и кольцо — копирование данных без CPU
+- [x] SDMA ucode и кольцо — микрокод обоих инстансов с CRC-верификацией, GFX-кольца 2x4 КБ в VRAM, writeback rptr, кик через MMIO WPTR, LINEAR_COPY и FENCE пакеты, GTT→VRAM→GTT в `ferens sdma-copy`
 - [ ] несколько очередей и VMID, приоритеты очередей
 
 ## tier 2 — события

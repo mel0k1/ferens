@@ -37,6 +37,13 @@ pub const META_OFFSET: u64 = CSB_OFFSET + CSB_BYTES as u64;
 pub const KERNEL_OFFSET: u64 = META_OFFSET + 0x1000;
 pub const DEFAULT_PAGE_OFFSET: u64 = KERNEL_OFFSET + 0x1000;
 pub const LAYOUT_END: u64 = DEFAULT_PAGE_OFFSET + 0x1000;
+pub const SDMA_RING_OFFSET: u64 = LAYOUT_END;
+pub const SDMA_RING_BYTES: usize = 4096;
+pub const SDMA_INSTANCE_STRIDE: u64 = 0x2000;
+pub const SDMA_META_OFFSET: u64 = SDMA_RING_OFFSET + SDMA_INSTANCE_STRIDE * 2;
+pub const SDMA_META_INSTANCE_STRIDE: u64 = 0x10;
+pub const SDMA_SCRATCH_OFFSET: u64 = SDMA_META_OFFSET + 0x1000;
+pub const SDMA_LAYOUT_END: u64 = SDMA_SCRATCH_OFFSET + 0x1000;
 pub const VM_WINDOW_BYTES: u64 = 0x100_0000;
 pub const GTT_WINDOW_BYTES: u64 = 0x100_0000;
 pub const GTT_BASE_VA: u64 = VRAM_BASE + VM_WINDOW_BYTES;
@@ -71,6 +78,41 @@ fn bound_driver(slot_dir: &Path) -> Option<String> {
     target
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
+}
+
+pub(crate) fn taken_by_driver(slot_dir: &Path) -> io::Result<()> {
+    if let Some(driver) = bound_driver(slot_dir) {
+        return Err(io::Error::other(format!(
+            "device bound to {driver}, unbind it before direct engine access"
+        )));
+    }
+    Ok(())
+}
+
+pub fn program_vm0<B: BarOps>(regs: &Mmio<B>, aperture: &mut MappedBar) -> io::Result<()> {
+    let start_pfn = (VRAM_BASE / vm::GPU_PAGE_BYTES) as u32;
+    let end_pfn =
+        ((VRAM_BASE + VM_WINDOW_BYTES + GTT_WINDOW_BYTES) / vm::GPU_PAGE_BYTES) as u32 - 1;
+    let pages = vm::pte_page_count(start_pfn, end_pfn);
+    let table_offset = (PTE_TABLE_OFFSET - VRAM_BASE) as usize;
+    let config = vm::VmConfig {
+        page_table_base_pfn: (PTE_TABLE_OFFSET / vm::GPU_PAGE_BYTES) as u32,
+        start_pfn,
+        end_pfn,
+        default_page_pfn: (DEFAULT_PAGE_OFFSET / vm::GPU_PAGE_BYTES) as u32,
+        pages,
+    };
+    vm::zero_entries(aperture, table_offset, pages)?;
+    vm::fill_identity_table(
+        aperture,
+        table_offset,
+        start_pfn,
+        (VM_WINDOW_BYTES / vm::GPU_PAGE_BYTES) as usize,
+    )?;
+    vm::program_l1_l2(regs);
+    vm::program_context0(regs, &config);
+    hdp::invalidate_with_flush(regs, hqd::VMID_0);
+    Ok(())
 }
 
 pub fn find_polaris() -> io::Result<PciDevice> {
@@ -111,11 +153,7 @@ pub fn dispatch_plan(grid: [u32; 3], group: [u32; 3]) -> DispatchPlan {
 
 impl CpQueue {
     pub fn create(slot_dir: &Path, chip: Chip) -> io::Result<Self> {
-        if let Some(driver) = bound_driver(slot_dir) {
-            return Err(io::Error::other(format!(
-                "device bound to {driver}, unbind it before direct cp access"
-            )));
-        }
+        taken_by_driver(slot_dir)?;
         let slot = slot_dir
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -128,10 +166,10 @@ impl CpQueue {
         let aperture_info = device
             .aperture_bar()
             .ok_or_else(|| io::Error::other("no frame buffer aperture bar"))?;
-        if aperture_info.size < LAYOUT_END {
+        if aperture_info.size < SDMA_LAYOUT_END {
             return Err(io::Error::other(format!(
                 "aperture bar is {:#x} bytes, need at least {:#x}",
-                aperture_info.size, LAYOUT_END
+                aperture_info.size, SDMA_LAYOUT_END
             )));
         }
         let regs_bar = MappedBar::from_sysfs(slot_dir, regs_info.index)?;
@@ -274,29 +312,7 @@ impl CpQueue {
     }
 
     fn setup_vm(&mut self) -> io::Result<()> {
-        let start_pfn = (VRAM_BASE / vm::GPU_PAGE_BYTES) as u32;
-        let end_pfn =
-            ((VRAM_BASE + VM_WINDOW_BYTES + GTT_WINDOW_BYTES) / vm::GPU_PAGE_BYTES) as u32 - 1;
-        let pages = vm::pte_page_count(start_pfn, end_pfn);
-        let table_offset = (PTE_TABLE_OFFSET - VRAM_BASE) as usize;
-        let config = vm::VmConfig {
-            page_table_base_pfn: (PTE_TABLE_OFFSET / vm::GPU_PAGE_BYTES) as u32,
-            start_pfn,
-            end_pfn,
-            default_page_pfn: (DEFAULT_PAGE_OFFSET / vm::GPU_PAGE_BYTES) as u32,
-            pages,
-        };
-        vm::zero_entries(&mut self.aperture, table_offset, pages)?;
-        vm::fill_identity_table(
-            &mut self.aperture,
-            table_offset,
-            start_pfn,
-            (VM_WINDOW_BYTES / vm::GPU_PAGE_BYTES) as usize,
-        )?;
-        vm::program_l1_l2(&self.regs);
-        vm::program_context0(&self.regs, &config);
-        hdp::invalidate_with_flush(&self.regs, hqd::VMID_0);
-        Ok(())
+        program_vm0(&self.regs, &mut self.aperture)
     }
 
     fn acquire_queue(&mut self) {
