@@ -23,8 +23,8 @@
 
 ## tier 2 — события
 
-- [ ] CP_INT и IH ring: первое время через uio, затем собственный kernel-модуль для MSI
-- [ ] fence по прерыванию вместо поллинга
+- [x] CP_INT и IH ring через uio — tonga_ih-последовательность (RB_SIZE log2(байт/4), WPTR writeback, overflow-танец, IV 16 байт, rptr в байтах), SDMA trap (src 224) и compute EOP через запись 0x20000000 в CPC_INT_STATUS (src 178), `ferens ih` гоняет оба пути через uio_pci_generic и poll на /dev/uioN
+- [ ] fence по прерыванию вместо поллинга — IV-приход разобран в `ferens ih`, осталось встроить в wait-путь очередей
 - [ ] детект зависания CP по таймаутам
 
 ## tier 3 — живучесть

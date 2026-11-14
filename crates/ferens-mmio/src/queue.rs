@@ -8,6 +8,7 @@ use ferens_gfx8::dispatch::{
     self, DispatchPlan, FENCE_MAGIC, FENCE_OFFSET, KERNARG_OFFSET, OUTPUT_OFFSET,
 };
 use ferens_gfx8::isa;
+use ferens_gfx8::op;
 use ferens_gfx8::pm4::PacketBuilder;
 use ferens_gfx8::regs;
 use ferens_gfx8::ring::write_packet;
@@ -52,6 +53,10 @@ pub const GFX_RING_OFFSET: u64 = SDMA_LAYOUT_END;
 pub const GFX_RING_BYTES: usize = 4096;
 pub const GFX_META_OFFSET: u64 = GFX_RING_OFFSET + GFX_RING_BYTES as u64;
 pub const GFX_LAYOUT_END: u64 = GFX_META_OFFSET + 0x1000;
+pub const IH_RING_OFFSET: u64 = GFX_LAYOUT_END;
+pub const IH_RING_BYTES: usize = 4096;
+pub const IH_WB_OFFSET: u64 = IH_RING_OFFSET + IH_RING_BYTES as u64;
+pub const IH_LAYOUT_END: u64 = IH_WB_OFFSET + 0x1000;
 pub const VM_WINDOW_BYTES: u64 = 0x100_0000;
 pub const GTT_WINDOW_BYTES: u64 = 0x100_0000;
 pub const GTT_BASE_VA: u64 = VRAM_BASE + VM_WINDOW_BYTES;
@@ -228,6 +233,25 @@ fn device_packets(plan: &DispatchPlan) -> Vec<u32> {
     builder.into_words()
 }
 
+pub fn fence_irq_packet(fence_va: u64) -> Vec<u32> {
+    let mut builder = PacketBuilder::new();
+    builder.write_data(
+        op::WRITE_DATA_DST_SEL_MEMORY,
+        op::WRITE_DATA_ENGINE_ME,
+        true,
+        fence_va,
+        &[FENCE_MAGIC],
+    );
+    builder.write_data(
+        op::WRITE_DATA_DST_SEL_REGISTER,
+        op::WRITE_DATA_ENGINE_ME,
+        true,
+        hqd::CPC_INT_STATUS as u64,
+        &[hqd::COMPUTE_EOP_TRIGGER],
+    );
+    builder.into_words()
+}
+
 impl CpDevice {
     pub fn create(slot_dir: &Path, chip: Chip) -> io::Result<Self> {
         taken_by_driver(slot_dir)?;
@@ -243,10 +267,10 @@ impl CpDevice {
         let aperture_info = device
             .aperture_bar()
             .ok_or_else(|| io::Error::other("no frame buffer aperture bar"))?;
-        if aperture_info.size < GFX_LAYOUT_END {
+        if aperture_info.size < IH_LAYOUT_END {
             return Err(io::Error::other(format!(
                 "aperture bar is {:#x} bytes, need at least {:#x}",
-                aperture_info.size, GFX_LAYOUT_END
+                aperture_info.size, IH_LAYOUT_END
             )));
         }
         let regs_bar = MappedBar::from_sysfs(slot_dir, regs_info.index)?;
@@ -568,6 +592,40 @@ impl CpDevice {
         device_packets(&plan)
     }
 
+    pub fn dispatch_stream_irq(
+        &mut self,
+        slot: usize,
+        grid: [u32; 3],
+        group: [u32; 3],
+    ) -> Vec<u32> {
+        let mut packets = self.dispatch_stream(slot, grid, group);
+        packets.extend(fence_irq_packet(slot_meta_va(slot) + FENCE_OFFSET as u64));
+        packets
+    }
+
+    pub fn enable_pipe_irq(&self, pipe: usize, on: bool) {
+        let reg = hqd::CP_ME1_PIPE0_INT_CNTL + pipe as u32;
+        let mut value = self.regs.read_reg_direct(reg);
+        if on {
+            value |= hqd::CP_INT_TIME_STAMP_INT_ENABLE;
+        } else {
+            value &= !hqd::CP_INT_TIME_STAMP_INT_ENABLE;
+        }
+        self.regs.write_reg_direct(reg, value);
+    }
+
+    pub fn regs(&self) -> &Mmio<MappedBar> {
+        &self.regs
+    }
+
+    pub fn aperture(&self) -> &MappedBar {
+        &self.aperture
+    }
+
+    pub fn aperture_mut(&mut self) -> &mut MappedBar {
+        &mut self.aperture
+    }
+
     pub fn alloc_gtt(&mut self, pages: usize) -> io::Result<GttBuffer> {
         let window_pages = (GTT_WINDOW_BYTES / vm::GPU_PAGE_BYTES) as usize;
         if self.gtt_cursor as usize + pages > window_pages {
@@ -740,6 +798,9 @@ mod tests {
         assert_eq!(GFX_RING_OFFSET, 0x0403_B000);
         assert_eq!(GFX_META_OFFSET, 0x0403_C000);
         assert_eq!(GFX_LAYOUT_END, 0x0403_D000);
+        assert_eq!(IH_RING_OFFSET, 0x0403_D000);
+        assert_eq!(IH_WB_OFFSET, 0x0403_E000);
+        assert_eq!(IH_LAYOUT_END, 0x0403_F000);
     }
 
     #[test]

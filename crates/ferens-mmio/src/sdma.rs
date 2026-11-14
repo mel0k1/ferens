@@ -62,8 +62,12 @@ pub const RB_RPTR_ADDR_LO_MASK: u32 = 0xffff_fffc;
 pub const OP_NOP: u32 = 0;
 pub const OP_COPY: u32 = 1;
 pub const OP_FENCE: u32 = 5;
+pub const OP_TRAP: u32 = 6;
 pub const SUBOP_COPY_LINEAR: u32 = 0;
 pub const COPY_COUNT_MAX: usize = 0x3f_ffff;
+pub const SDMA_CNTL: u32 = 0x3404;
+pub const SDMA_CNTL_TRAP_ENABLE: u32 = 1;
+pub const TRAP_INT_CONTEXT_MASK: u32 = 0x0FFF_FFFF;
 
 pub const FENCE_MAGIC: u32 = 0x5344_4d41;
 pub const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,6 +107,27 @@ pub fn fence_packet(fence_va: u64) -> Vec<u32> {
         (fence_va >> 32) as u32,
         FENCE_MAGIC,
     ]
+}
+
+pub fn trap_packet(context: u32) -> Vec<u32> {
+    vec![OP_TRAP, context & TRAP_INT_CONTEXT_MASK]
+}
+
+pub fn fence_packet_with_irq(fence_va: u64, context: u32) -> Vec<u32> {
+    let mut packets = fence_packet(fence_va);
+    packets.extend(trap_packet(context));
+    packets
+}
+
+pub fn trap_enable<B: BarOps>(regs: &Mmio<B>, instance: usize, on: bool) {
+    let offset = SDMA_CNTL + instance as u32 * SDMA_REGISTER_STRIDE;
+    let mut cntl = regs.read_reg_direct(offset);
+    if on {
+        cntl |= SDMA_CNTL_TRAP_ENABLE;
+    } else {
+        cntl &= !SDMA_CNTL_TRAP_ENABLE;
+    }
+    regs.write_reg_direct(offset, cntl);
 }
 
 pub struct SdmaStatus {
@@ -367,6 +392,54 @@ impl Sdma {
         Ok(())
     }
 
+    pub fn copy_with_irq(
+        &mut self,
+        dst_va: u64,
+        src_va: u64,
+        bytes: usize,
+        context: u32,
+    ) -> io::Result<()> {
+        if bytes == 0 || bytes > COPY_COUNT_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "copy size must be 1..0x3fffff bytes",
+            ));
+        }
+        let instance = 0;
+        let fence_va = meta_va(instance);
+        let mut packets = copy_packet(dst_va, src_va, bytes);
+        packets.extend(fence_packet_with_irq(fence_va, context));
+        self.aperture.write_u32((fence_va - VRAM_BASE) as usize, 0);
+        {
+            let aperture = self.aperture.words_mut();
+            let first = ((ring_va(instance) - VRAM_BASE) / 4) as usize;
+            let ring = &mut aperture[first..first + self.ring_dw];
+            let next = write_packet(ring, self.wp, &packets).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "packets do not fit the sdma ring",
+                )
+            })?;
+            self.wp = next;
+        }
+        hdp::flush(&self.regs);
+        self.regs
+            .write_reg_direct(GFX_RB_WPTR, (self.wp as u32) << 2);
+        Ok(())
+    }
+
+    pub fn regs(&self) -> &Mmio<MappedBar> {
+        &self.regs
+    }
+
+    pub fn aperture(&self) -> &MappedBar {
+        &self.aperture
+    }
+
+    pub fn aperture_mut(&mut self) -> &mut MappedBar {
+        &mut self.aperture
+    }
+
     pub fn wait_fence(&self, instance: usize) -> io::Result<u32> {
         let started = Instant::now();
         let fence_offset = (meta_va(instance) - VRAM_BASE) as usize;
@@ -486,6 +559,47 @@ mod tests {
     fn fence_packet_is_nop_then_fence_with_magic() {
         let packet = fence_packet(0x0401_9000);
         assert_eq!(packet, vec![OP_NOP, OP_FENCE, 0x0401_9000, 0, FENCE_MAGIC]);
+    }
+
+    #[test]
+    fn trap_packet_carries_context() {
+        let packet = trap_packet(0xABCD_1234);
+        assert_eq!(packet, vec![OP_TRAP, 0xABCD_1234 & TRAP_INT_CONTEXT_MASK]);
+        assert_eq!(trap_packet(0x1234), vec![OP_TRAP, 0x1234]);
+    }
+
+    #[test]
+    fn fence_packet_with_irq_appends_trap() {
+        let packet = fence_packet_with_irq(0x0401_9000, 1);
+        assert_eq!(
+            packet,
+            vec![OP_NOP, OP_FENCE, 0x0401_9000, 0, FENCE_MAGIC, OP_TRAP, 1,]
+        );
+    }
+
+    #[test]
+    fn trap_enable_toggles_cntl_bit_per_instance() {
+        let mmio = Mmio::new(FakeBar::for_instance(0));
+        mmio.bar().cells.borrow_mut()[SDMA_CNTL as usize] = 0xDEAD_0000;
+        mmio.bar().cells.borrow_mut()[SDMA_CNTL as usize + SDMA_REGISTER_STRIDE as usize] = 0;
+        trap_enable(&mmio, 0, true);
+        trap_enable(&mmio, 1, true);
+        {
+            let cells = mmio.bar().cells.borrow();
+            assert_eq!(
+                cells[SDMA_CNTL as usize],
+                0xDEAD_0000 | SDMA_CNTL_TRAP_ENABLE
+            );
+            assert_eq!(
+                cells[SDMA_CNTL as usize + SDMA_REGISTER_STRIDE as usize],
+                SDMA_CNTL_TRAP_ENABLE
+            );
+        }
+        trap_enable(&mmio, 0, false);
+        assert_eq!(
+            mmio.bar().cells.borrow()[SDMA_CNTL as usize],
+            0xDEAD_0000 & !SDMA_CNTL_TRAP_ENABLE
+        );
     }
 
     #[test]

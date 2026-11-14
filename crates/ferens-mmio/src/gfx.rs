@@ -400,7 +400,7 @@ mod tests {
         let packet = fence_packet(0x0403_A000);
         assert_eq!(packet.len(), 5);
         assert_eq!(packet[0] >> 30, 3);
-        assert_eq!((packet[0] >> 16) & 0x3FFF, 4);
+        assert_eq!((packet[0] >> 16) & 0x3FFF, 3);
         assert_eq!((packet[0] >> 8) & 0xFF, ferens_gfx8::op::WRITE_DATA as u32);
         assert_eq!(
             packet[1] & 0xFF00,

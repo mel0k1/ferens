@@ -125,11 +125,11 @@ impl PacketBuilder {
         data: &[u32],
     ) {
         assert!(
-            data.len() as u32 <= PACKET_COUNT_MAX - 3,
+            data.len() as u32 <= PACKET_COUNT_MAX - 2,
             "packet too large for header"
         );
         self.words
-            .push(type3_header(op::WRITE_DATA, 3 + data.len() as u32));
+            .push(type3_header(op::WRITE_DATA, 2 + data.len() as u32));
         let mut control = (dst_sel << 8) | (engine_sel << 30);
         if confirm {
             control |= op::WRITE_DATA_WR_CONFIRM;
@@ -199,7 +199,7 @@ mod tests {
             | op::WRITE_DATA_WR_CONFIRM;
         assert_eq!(
             builder.as_slice(),
-            &[0xC004_3700, control, 0, 0x1, 0xDEAD_BEEF]
+            &[0xC003_3700, control, 0, 0x1, 0xDEAD_BEEF]
         );
     }
 

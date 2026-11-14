@@ -98,7 +98,7 @@ mod tests {
             1,
             1,
             regs::DISPATCH_SHADER_EN,
-            0xC004_3700,
+            0xC003_3700,
             (op::WRITE_DATA_DST_SEL_MEMORY << 8)
                 | (op::WRITE_DATA_ENGINE_ME << 30)
                 | op::WRITE_DATA_WR_CONFIRM,

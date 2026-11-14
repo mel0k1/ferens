@@ -5,7 +5,10 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ferens_core::{scan_sysfs, MappedBar, Mmio, SYSFS_PCI_DEVICES};
+use ferens_core::{
+    ensure_uio_bound, scan_sysfs, set_command_flags, unbind_current, unbind_uio, MappedBar, Mmio,
+    UioDevice, SYSFS_PCI_DEVICES,
+};
 use ferens_gfx8::dispatch::{
     self, DispatchPlan, FENCE_MAGIC, FENCE_OFFSET, KERNARG_OFFSET, OUTPUT_OFFSET,
 };
@@ -13,12 +16,15 @@ use ferens_gfx8::isa;
 use ferens_gfx8::pm4::PacketBuilder;
 use ferens_gfx8::regs;
 use ferens_kfd::{Allocator, ComputeQueue, Device, GPU_PAGE_BYTES};
-use ferens_mmio::{CpDevice, GfxRing, QueuePriority, Sdma};
+use ferens_mmio::ih;
+use ferens_mmio::{CpDevice, GfxRing, IvEntry, QueuePriority, Sdma};
 
-const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens queues | ferens gfx-ring | ferens status | ferens sdma-copy [bytes]";
+const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens queues | ferens gfx-ring | ferens ih | ferens status | ferens sdma-copy [bytes]";
 
 const RING_BYTES: usize = 4096;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
+const IH_WAIT: Duration = Duration::from_secs(5);
+const SDMA_TRAP_CONTEXT: u32 = 1;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,8 +40,171 @@ fn main() {
         Some("sdma-copy") => run_sdma_copy(args.get(1).map(String::as_str)),
         Some("queues") => run_queues(),
         Some("gfx-ring") => run_gfx_ring(),
+        Some("ih") => run_ih(),
         _ => eprintln!("{USAGE}"),
     }
+}
+
+fn run_ih() {
+    if let Err(error) = ih_live() {
+        eprintln!("ih failed: {error}");
+    }
+}
+
+fn drain_ih(sdma: &Sdma) -> io::Result<Vec<IvEntry>> {
+    let regs = sdma.regs();
+    let aperture = sdma.aperture();
+    let wb_offset = (ferens_mmio::IH_WB_OFFSET - ferens_mmio::VRAM_BASE) as usize;
+    let wptr = ih::wait_for_wptr(
+        regs,
+        aperture,
+        wb_offset,
+        ferens_mmio::IH_RING_BYTES as u32,
+        IH_WAIT,
+    )?;
+    let ring = aperture.words();
+    let first = ((ferens_mmio::IH_RING_OFFSET - ferens_mmio::VRAM_BASE) / 4) as usize;
+    let entries = ih::drain(
+        &ring[first..first + ferens_mmio::IH_RING_BYTES / 4],
+        0,
+        wptr,
+        ferens_mmio::IH_RING_BYTES as u32,
+    );
+    ih::set_rptr(regs, wptr);
+    Ok(entries)
+}
+
+fn print_entries(entries: &[IvEntry]) {
+    for entry in entries {
+        println!("iv: {}", entry.report());
+    }
+}
+
+fn ih_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let freed_driver = unbind_current(&slot_dir, &device.slot)?;
+    if let Some(driver) = &freed_driver {
+        println!("unbound {driver}");
+    }
+    let mut sdma = Sdma::open(&slot_dir, device.chip)?;
+    let mut cp = CpDevice::create(&slot_dir, device.chip)?;
+    let uio_path = ensure_uio_bound(&device.slot)?;
+    set_command_flags(&slot_dir)?;
+    let uio = UioDevice::open(&uio_path)?;
+    println!(
+        "uio {} bound, {} bar maps, bus master on, intx enabled",
+        uio_path.display(),
+        uio.maps.len()
+    );
+    {
+        let words = sdma.aperture_mut().words_mut();
+        let first = ((ferens_mmio::IH_RING_OFFSET - ferens_mmio::VRAM_BASE) / 4) as usize;
+        for word in &mut words[first..first + ferens_mmio::IH_RING_BYTES / 4] {
+            *word = 0;
+        }
+        words[((ferens_mmio::IH_WB_OFFSET - ferens_mmio::VRAM_BASE) / 4) as usize] = 0;
+    }
+    ih::setup(
+        sdma.regs(),
+        ferens_mmio::IH_RING_OFFSET,
+        ferens_mmio::IH_WB_OFFSET,
+        ferens_mmio::DEFAULT_PAGE_OFFSET,
+        ferens_mmio::IH_RING_BYTES as u32,
+    );
+    ih::enable(sdma.regs());
+    ferens_mmio::sdma::trap_enable(sdma.regs(), 0, true);
+    println!(
+        "ih ring {} bytes at {:#x}, wptr writeback {:#x}, rb enabled, sdma0 trap enabled",
+        ferens_mmio::IH_RING_BYTES,
+        ferens_mmio::IH_RING_OFFSET,
+        ferens_mmio::IH_WB_OFFSET
+    );
+
+    let buffer = sdma.alloc_gtt(2)?;
+    for index in 0..256 {
+        buffer.host.write_u32(index * 4, 0x1111_0000 + index as u32);
+    }
+    let dst_va = buffer.va + 0x1000;
+    println!("sdma0: копирую 1 КБ gtt->gtt с trap-пакетом (context {SDMA_TRAP_CONTEXT:#x}), жду /dev/uio");
+    sdma.copy_with_irq(dst_va, buffer.va, 1024, SDMA_TRAP_CONTEXT)?;
+    uio.wait_interrupt(IH_WAIT)?;
+    let sdma_entries = drain_ih(&sdma)?;
+    print_entries(&sdma_entries);
+    if !sdma_entries
+        .iter()
+        .any(|entry| entry.src_id == ih::SRC_ID_SDMA0_TRAP)
+    {
+        return Err(io::Error::other(format!(
+            "no sdma0 trap iv in the ring ({} entries)",
+            sdma_entries.len()
+        )));
+    }
+    let fence = sdma.wait_fence(0)?;
+    let mut mismatch = false;
+    for index in 0..256 {
+        if buffer.host.read_u32(0x1000 + index * 4) != 0x1111_0000 + index as u32 {
+            mismatch = true;
+        }
+    }
+    println!(
+        "sdma0: фенс {fence:#x}, данные после копирования {}",
+        if mismatch {
+            "не совпали"
+        } else {
+            "совпали"
+        }
+    );
+
+    cp.open_queue(0, 0, QueuePriority::normal())?;
+    cp.enable_pipe_irq(0, true);
+    cp.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = cp.dispatch_stream_irq(0, [1, 1, 1], [64, 1, 1]);
+    println!(
+        "compute slot 0: диспетч {} двордов с записью {:#x} в CPC_INT_STATUS (src_id 178), жду /dev/uio",
+        stream.len(),
+        ferens_mmio::hqd::COMPUTE_EOP_TRIGGER
+    );
+    cp.submit(0, &stream)?;
+    uio.wait_interrupt(IH_WAIT)?;
+    let cp_entries = drain_ih(&sdma)?;
+    print_entries(&cp_entries);
+    if !cp_entries
+        .iter()
+        .any(|entry| entry.src_id == ih::SRC_ID_COMPUTE_EOP)
+    {
+        return Err(io::Error::other(format!(
+            "no compute eop iv in the ring ({} entries)",
+            cp_entries.len()
+        )));
+    }
+    let fence = cp.wait_fence(0, FENCE_TIMEOUT)?;
+    println!(
+        "compute slot 0: фенс {fence:#x}, output {:#010x}",
+        cp.meta_u32(0, OUTPUT_OFFSET)
+    );
+
+    cp.enable_pipe_irq(0, false);
+    ih::disable(sdma.regs());
+    ferens_mmio::sdma::trap_enable(sdma.regs(), 0, false);
+    cp.destroy()?;
+    sdma.destroy()?;
+    unbind_uio(&device.slot)?;
+    println!("teardown: ih выключен, uio отвязан");
+    if let Some(driver) = &freed_driver {
+        println!(
+            "вернуть карту: echo {} > /sys/bus/pci/drivers/{driver}/bind",
+            device.slot
+        );
+    }
+    Ok(())
 }
 
 fn run_list() {

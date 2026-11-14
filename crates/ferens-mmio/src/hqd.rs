@@ -39,6 +39,10 @@ pub const CP_HQD_ERROR: u32 = 0x3278;
 
 pub const CP_MEC_CNTL_ME1_HALT: u32 = 1 << 30;
 pub const CP_MEC_CNTL_ME2_HALT: u32 = 1 << 28;
+pub const CP_ME1_PIPE0_INT_CNTL: u32 = 0x3085;
+pub const CP_INT_TIME_STAMP_INT_ENABLE: u32 = 0x400_0000;
+pub const CPC_INT_STATUS: u32 = 0x30B5;
+pub const COMPUTE_EOP_TRIGGER: u32 = 0x2000_0000;
 pub const CP_HQD_ACTIVE_BIT: u32 = 1;
 pub const CP_HQD_DEQUEUE_DRAIN: u32 = 1;
 pub const CP_HQD_DEQUEUE_RESET_WAVES: u32 = 2;
