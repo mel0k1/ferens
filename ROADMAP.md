@@ -12,14 +12,14 @@
 - [x] CRC — readback-верификация всего, что пишется в GPU через MMIO-окна: RLC ucode (RLC_GPM_UCODE_ADDR/DATA), MEC1/MEC2 ucode (CP_MEC_MEx_UCODE_ADDR/DATA), CSB в VRAM; несовпадение CRC32 — ошибка init, а не тихий мусор в SRAM
 - [x] IOMMU guard — отказ на старте, если устройство сидит в /sys/kernel/iommu_groups: DMA в системную память уйдёт мимо наших PTE; обходной лаз — FERENS_IOMMU_ALLOW=1
 
-## tier 1 — ucode и очередь (частично готово)
+## tier 1 — ucode и очередь (готово)
 
 - [x] RLC ucode + SRM-список из rlc.bin, CSB из clearstate_vi.h, PG-инициализация на polaris11/12
 - [x] MEC1/MEC2 ucode, CP_HQD через MMIO, doorbell, PM4 dispatch, fence polling
 - [x] GTT: identity-окно VRAM + системные PTE из /proc/self/pagemap, alloc_gtt
-- [ ] GFX ucode (PFP/ME/CE) и gfx ring — для compute не нужен, нужен для графики
+- [x] GFX ucode (PFP/ME/CE) и gfx ring — три окна загрузки с CRC-верификацией, кольцо 4 КБ в VRAM с writeback rptr, кик через MMIO WPTR, WRITE_DATA-фенс как ring_test_ring, `ferens gfx-ring`; до clear-state-потока и отрисовки не доведено
 - [x] SDMA ucode и кольцо — микрокод обоих инстансов с CRC-верификацией, GFX-кольца 2x4 КБ в VRAM, writeback rptr, кик через MMIO WPTR, LINEAR_COPY и FENCE пакеты, GTT→VRAM→GTT в `ferens sdma-copy`
-- [ ] несколько очередей и VMID, приоритеты очередей
+- [x] несколько очередей и VMID, приоритеты — до 8 слотов через CP_HQD (ME1 pipe0-3 и ME2 с mec2.bin), doorbell MEC_RING0+slot, CP_HQD_PIPE/QUEUE_PRIORITY + CP_HQD_QUANTUM, VMID1 со своей таблицей VM_CONTEXT1, GTT-аллокации в обе таблицы, `ferens queues` пускает слот 0 (VMID0, normal) и слот 1 (VMID1, high) разом
 
 ## tier 2 — события
 

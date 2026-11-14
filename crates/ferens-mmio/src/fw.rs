@@ -253,6 +253,16 @@ pub fn load_sdma(chip: Chip) -> io::Result<[UcodeFirmware; 2]> {
     Ok([instance0, instance1])
 }
 
+pub fn load_gfx(chip: Chip) -> io::Result<[UcodeFirmware; 3]> {
+    let prefix = chip_prefix(chip)?;
+    let dir = Path::new(FIRMWARE_DIR);
+    let dir_alt = Path::new(FIRMWARE_DIR_ALT);
+    let pfp = load_required(dir, dir_alt, prefix, "pfp", parse_gfx_firmware)?;
+    let ce = load_required(dir, dir_alt, prefix, "ce", parse_gfx_firmware)?;
+    let me = load_required(dir, dir_alt, prefix, "me", parse_gfx_firmware)?;
+    Ok([pfp, ce, me])
+}
+
 fn read_firmware(dir: &Path, dir_alt: &Path, prefix: &str, suffix: &str) -> io::Result<Vec<u8>> {
     let path = dir.join(format!("{prefix}_{suffix}.bin"));
     match fs::read(&path) {

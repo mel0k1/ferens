@@ -13,6 +13,12 @@ pub const VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR: u32 = 0x546;
 pub const VM_CONTEXT0_PAGE_TABLE_BASE_ADDR: u32 = 0x54F;
 pub const VM_CONTEXT0_PAGE_TABLE_START_ADDR: u32 = 0x557;
 pub const VM_CONTEXT0_PAGE_TABLE_END_ADDR: u32 = 0x55F;
+pub const VM_CONTEXT1_CNTL: u32 = 0x505;
+pub const VM_CONTEXT1_CNTL2: u32 = 0x50D;
+pub const VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR: u32 = 0x547;
+pub const VM_CONTEXT1_PAGE_TABLE_BASE_ADDR: u32 = 0x550;
+pub const VM_CONTEXT1_PAGE_TABLE_START_ADDR: u32 = 0x558;
+pub const VM_CONTEXT1_PAGE_TABLE_END_ADDR: u32 = 0x560;
 pub const VM_L2_CNTL4: u32 = 0x578;
 pub const MC_VM_MX_L1_TLB_CNTL: u32 = 0x819;
 
@@ -179,21 +185,54 @@ pub fn program_l1_l2<B: BarOps>(mmio: &Mmio<B>) {
 }
 
 pub fn program_context0<B: BarOps>(mmio: &Mmio<B>, config: &VmConfig) {
-    mmio.write_reg_direct(VM_CONTEXT0_PAGE_TABLE_START_ADDR, config.start_pfn);
-    mmio.write_reg_direct(VM_CONTEXT0_PAGE_TABLE_END_ADDR, config.end_pfn);
-    mmio.write_reg_direct(VM_CONTEXT0_PAGE_TABLE_BASE_ADDR, config.page_table_base_pfn);
-    mmio.write_reg_direct(
-        VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR,
-        config.default_page_pfn,
-    );
-    mmio.write_reg_direct(VM_CONTEXT0_CNTL2, 0);
+    program_context(mmio, 0, config)
+}
 
-    let mut value = mmio.read_reg_direct(VM_CONTEXT0_CNTL);
+pub struct ContextRegs {
+    pub cntl: u32,
+    pub cntl2: u32,
+    pub default_addr: u32,
+    pub base_addr: u32,
+    pub start_addr: u32,
+    pub end_addr: u32,
+}
+
+pub fn context_regs(context: u32) -> ContextRegs {
+    match context {
+        0 => ContextRegs {
+            cntl: VM_CONTEXT0_CNTL,
+            cntl2: VM_CONTEXT0_CNTL2,
+            default_addr: VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR,
+            base_addr: VM_CONTEXT0_PAGE_TABLE_BASE_ADDR,
+            start_addr: VM_CONTEXT0_PAGE_TABLE_START_ADDR,
+            end_addr: VM_CONTEXT0_PAGE_TABLE_END_ADDR,
+        },
+        1 => ContextRegs {
+            cntl: VM_CONTEXT1_CNTL,
+            cntl2: VM_CONTEXT1_CNTL2,
+            default_addr: VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR,
+            base_addr: VM_CONTEXT1_PAGE_TABLE_BASE_ADDR,
+            start_addr: VM_CONTEXT1_PAGE_TABLE_START_ADDR,
+            end_addr: VM_CONTEXT1_PAGE_TABLE_END_ADDR,
+        },
+        _ => panic!("unsupported vm context {context}"),
+    }
+}
+
+pub fn program_context<B: BarOps>(mmio: &Mmio<B>, context: u32, config: &VmConfig) {
+    let regs = context_regs(context);
+    mmio.write_reg_direct(regs.start_addr, config.start_pfn);
+    mmio.write_reg_direct(regs.end_addr, config.end_pfn);
+    mmio.write_reg_direct(regs.base_addr, config.page_table_base_pfn);
+    mmio.write_reg_direct(regs.default_addr, config.default_page_pfn);
+    mmio.write_reg_direct(regs.cntl2, 0);
+
+    let mut value = mmio.read_reg_direct(regs.cntl);
     value |= VM_ENABLE_CONTEXT
         | (VM_PAGE_TABLE_DEPTH_FLAT << 1)
         | VM_RANGE_PROTECTION_FAULT_ENABLE_DEFAULT;
     value &= !VM_PAGE_TABLE_DEPTH_MASK;
-    mmio.write_reg_direct(VM_CONTEXT0_CNTL, value);
+    mmio.write_reg_direct(regs.cntl, value);
 }
 
 pub fn invalidate<B: BarOps>(mmio: &Mmio<B>, vmid: u32) {

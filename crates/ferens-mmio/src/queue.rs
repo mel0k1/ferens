@@ -25,25 +25,33 @@ use crate::rlc;
 use crate::vm;
 
 pub const VRAM_BASE: u64 = 0x0400_0000;
+pub const QUEUE_SLOTS: usize = 8;
 pub const RING_OFFSET: u64 = VRAM_BASE;
 pub const RING_BYTES: usize = 4096;
-pub const MQD_SHADOW_OFFSET: u64 = VRAM_BASE + 0x1000;
+pub const RING_STRIDE: u64 = 0x1000;
+pub const MQD_SHADOW_OFFSET: u64 = RING_OFFSET + RING_STRIDE * QUEUE_SLOTS as u64;
 pub const MQD_SHADOW_BYTES: usize = 4096;
-pub const PTE_TABLE_OFFSET: u64 = VRAM_BASE + 0x2000;
+pub const PTE_TABLE_OFFSET: u64 = MQD_SHADOW_OFFSET + MQD_SHADOW_BYTES as u64;
 pub const PTE_TABLE_BYTES: usize = 65536;
-pub const CSB_OFFSET: u64 = PTE_TABLE_OFFSET + PTE_TABLE_BYTES as u64;
+pub const PTE1_TABLE_OFFSET: u64 = PTE_TABLE_OFFSET + PTE_TABLE_BYTES as u64;
+pub const CSB_OFFSET: u64 = PTE1_TABLE_OFFSET + PTE_TABLE_BYTES as u64;
 pub const CSB_BYTES: usize = 8192;
-pub const META_OFFSET: u64 = CSB_OFFSET + CSB_BYTES as u64;
-pub const KERNEL_OFFSET: u64 = META_OFFSET + 0x1000;
+pub const KERNEL_OFFSET: u64 = CSB_OFFSET + CSB_BYTES as u64;
 pub const DEFAULT_PAGE_OFFSET: u64 = KERNEL_OFFSET + 0x1000;
 pub const LAYOUT_END: u64 = DEFAULT_PAGE_OFFSET + 0x1000;
-pub const SDMA_RING_OFFSET: u64 = LAYOUT_END;
+pub const SLOT_META_OFFSET: u64 = LAYOUT_END;
+pub const SLOT_META_STRIDE: u64 = 0x1000;
+pub const SDMA_RING_OFFSET: u64 = SLOT_META_OFFSET + SLOT_META_STRIDE * QUEUE_SLOTS as u64;
 pub const SDMA_RING_BYTES: usize = 4096;
 pub const SDMA_INSTANCE_STRIDE: u64 = 0x2000;
 pub const SDMA_META_OFFSET: u64 = SDMA_RING_OFFSET + SDMA_INSTANCE_STRIDE * 2;
 pub const SDMA_META_INSTANCE_STRIDE: u64 = 0x10;
 pub const SDMA_SCRATCH_OFFSET: u64 = SDMA_META_OFFSET + 0x1000;
 pub const SDMA_LAYOUT_END: u64 = SDMA_SCRATCH_OFFSET + 0x1000;
+pub const GFX_RING_OFFSET: u64 = SDMA_LAYOUT_END;
+pub const GFX_RING_BYTES: usize = 4096;
+pub const GFX_META_OFFSET: u64 = GFX_RING_OFFSET + GFX_RING_BYTES as u64;
+pub const GFX_LAYOUT_END: u64 = GFX_META_OFFSET + 0x1000;
 pub const VM_WINDOW_BYTES: u64 = 0x100_0000;
 pub const GTT_WINDOW_BYTES: u64 = 0x100_0000;
 pub const GTT_BASE_VA: u64 = VRAM_BASE + VM_WINDOW_BYTES;
@@ -59,17 +67,52 @@ pub struct GttBuffer {
     pub va: u64,
 }
 
-pub struct CpQueue {
+pub const GFX_PIPE_PRIO_NORMAL: u32 = 0;
+pub const GFX_PIPE_PRIO_HIGH: u32 = 2;
+pub const GFX_QUEUE_PRIO_MAX: u32 = 15;
+
+pub struct QueuePriority {
+    pub pipe: u32,
+    pub queue: u32,
+}
+
+impl QueuePriority {
+    pub fn normal() -> Self {
+        Self {
+            pipe: GFX_PIPE_PRIO_NORMAL,
+            queue: 0,
+        }
+    }
+
+    pub fn high() -> Self {
+        Self {
+            pipe: GFX_PIPE_PRIO_HIGH,
+            queue: GFX_QUEUE_PRIO_MAX,
+        }
+    }
+}
+
+pub struct QueueState {
+    pub slot: usize,
+    pub me: u32,
+    pub pipe: u32,
+    pub queue: u32,
+    pub vmid: u32,
+    pub priority: QueuePriority,
+    pub ring_dw: usize,
+    pub doorbell_index: u32,
+    pub wp: usize,
+}
+
+pub struct CpDevice {
     regs: Mmio<MappedBar>,
     aperture: MappedBar,
     pub mec_fw_version: u32,
     pub rlc_fw_version: u32,
     pub mec2_loaded: bool,
     pub pg_initialized: bool,
-    pub ring_dw: usize,
-    pub doorbell_index: u32,
     gtt_cursor: u32,
-    wp: usize,
+    queues: Vec<QueueState>,
     destroyed: bool,
 }
 
@@ -89,28 +132,38 @@ pub(crate) fn taken_by_driver(slot_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn program_vm0<B: BarOps>(regs: &Mmio<B>, aperture: &mut MappedBar) -> io::Result<()> {
+pub fn program_identity_context<B: BarOps>(
+    regs: &Mmio<B>,
+    aperture: &mut MappedBar,
+    context: u32,
+    table_offset: u64,
+) -> io::Result<()> {
     let start_pfn = (VRAM_BASE / vm::GPU_PAGE_BYTES) as u32;
     let end_pfn =
         ((VRAM_BASE + VM_WINDOW_BYTES + GTT_WINDOW_BYTES) / vm::GPU_PAGE_BYTES) as u32 - 1;
     let pages = vm::pte_page_count(start_pfn, end_pfn);
-    let table_offset = (PTE_TABLE_OFFSET - VRAM_BASE) as usize;
+    let table_byte_offset = (table_offset - VRAM_BASE) as usize;
     let config = vm::VmConfig {
-        page_table_base_pfn: (PTE_TABLE_OFFSET / vm::GPU_PAGE_BYTES) as u32,
+        page_table_base_pfn: (table_offset / vm::GPU_PAGE_BYTES) as u32,
         start_pfn,
         end_pfn,
         default_page_pfn: (DEFAULT_PAGE_OFFSET / vm::GPU_PAGE_BYTES) as u32,
         pages,
     };
-    vm::zero_entries(aperture, table_offset, pages)?;
+    vm::zero_entries(aperture, table_byte_offset, pages)?;
     vm::fill_identity_table(
         aperture,
-        table_offset,
+        table_byte_offset,
         start_pfn,
         (VM_WINDOW_BYTES / vm::GPU_PAGE_BYTES) as usize,
     )?;
+    vm::program_context(regs, context, &config);
+    Ok(())
+}
+
+pub fn program_vm0<B: BarOps>(regs: &Mmio<B>, aperture: &mut MappedBar) -> io::Result<()> {
+    program_identity_context(regs, aperture, 0, PTE_TABLE_OFFSET)?;
     vm::program_l1_l2(regs);
-    vm::program_context0(regs, &config);
     hdp::invalidate_with_flush(regs, hqd::VMID_0);
     Ok(())
 }
@@ -128,30 +181,54 @@ pub fn find_polaris() -> io::Result<PciDevice> {
         .ok_or_else(|| io::Error::other("no polaris10/11/12 gpu found"))
 }
 
-pub fn dispatch_stream_va(grid: [u32; 3], group: [u32; 3], payload_va: u64) -> Vec<u32> {
-    let plan = DispatchPlan {
+pub fn slot_engine(slot: usize) -> (u32, u32, u32, u32) {
+    (
+        (slot / 4 + 1) as u32,
+        (slot % 4) as u32,
+        0,
+        (hqd::DOORBELL_MEC_RING0 + slot as u32),
+    )
+}
+
+pub fn slot_meta_va(slot: usize) -> u64 {
+    SLOT_META_OFFSET + slot as u64 * SLOT_META_STRIDE
+}
+
+pub fn slot_ring_va(slot: usize) -> u64 {
+    RING_OFFSET + slot as u64 * RING_STRIDE
+}
+
+pub fn dispatch_plan_for(grid: [u32; 3], group: [u32; 3], payload_va: u64) -> DispatchPlan {
+    DispatchPlan {
         kernel_va: KERNEL_OFFSET,
         kernarg_va: payload_va + KERNARG_OFFSET as u64,
         fence_va: payload_va + FENCE_OFFSET as u64,
         output_va: payload_va + OUTPUT_OFFSET as u64,
         grid,
         group,
-    };
-    CpQueue::dispatch_packets(&plan)
-}
-
-pub fn dispatch_plan(grid: [u32; 3], group: [u32; 3]) -> DispatchPlan {
-    DispatchPlan {
-        kernel_va: KERNEL_OFFSET,
-        kernarg_va: META_OFFSET + KERNARG_OFFSET as u64,
-        fence_va: META_OFFSET + FENCE_OFFSET as u64,
-        output_va: META_OFFSET + OUTPUT_OFFSET as u64,
-        grid,
-        group,
     }
 }
 
-impl CpQueue {
+pub fn dispatch_stream_va(grid: [u32; 3], group: [u32; 3], payload_va: u64) -> Vec<u32> {
+    let plan = dispatch_plan_for(grid, group, payload_va);
+    device_packets(&plan)
+}
+
+fn device_packets(plan: &DispatchPlan) -> Vec<u32> {
+    let mut builder = PacketBuilder::new();
+    for reg in [
+        regs::COMPUTE_STATIC_THREAD_MGMT_SE0,
+        regs::COMPUTE_STATIC_THREAD_MGMT_SE1,
+        regs::COMPUTE_STATIC_THREAD_MGMT_SE2,
+        regs::COMPUTE_STATIC_THREAD_MGMT_SE3,
+    ] {
+        builder.set_sh_reg(regs::sh_offset(reg), &[0xFFFF_FFFF]);
+    }
+    dispatch::push(&mut builder, plan);
+    builder.into_words()
+}
+
+impl CpDevice {
     pub fn create(slot_dir: &Path, chip: Chip) -> io::Result<Self> {
         taken_by_driver(slot_dir)?;
         let slot = slot_dir
@@ -166,10 +243,10 @@ impl CpQueue {
         let aperture_info = device
             .aperture_bar()
             .ok_or_else(|| io::Error::other("no frame buffer aperture bar"))?;
-        if aperture_info.size < SDMA_LAYOUT_END {
+        if aperture_info.size < GFX_LAYOUT_END {
             return Err(io::Error::other(format!(
                 "aperture bar is {:#x} bytes, need at least {:#x}",
-                aperture_info.size, SDMA_LAYOUT_END
+                aperture_info.size, GFX_LAYOUT_END
             )));
         }
         let regs_bar = MappedBar::from_sysfs(slot_dir, regs_info.index)?;
@@ -177,21 +254,19 @@ impl CpQueue {
         let regs = Mmio::new(regs_bar);
         let firmware = fw::load(chip)?;
 
-        let mut queue = Self {
+        let mut device = Self {
             regs,
             aperture,
             mec_fw_version: firmware.mec1.version,
             rlc_fw_version: firmware.rlc.version,
             mec2_loaded: firmware.mec2.is_some(),
             pg_initialized: false,
-            ring_dw: RING_BYTES / 4,
-            doorbell_index: hqd::DOORBELL_INDEX,
             gtt_cursor: 0,
-            wp: 0,
+            queues: Vec::new(),
             destroyed: false,
         };
-        queue.bring_up(firmware, chip)?;
-        Ok(queue)
+        device.bring_up(firmware, chip)?;
+        Ok(device)
     }
 
     fn bring_up(&mut self, firmware: FirmwareSet, chip: Chip) -> io::Result<()> {
@@ -264,7 +339,15 @@ impl CpQueue {
         );
 
         self.setup_vm()?;
-        self.program_hqd()?;
+        Ok(())
+    }
+
+    fn setup_vm(&mut self) -> io::Result<()> {
+        program_identity_context(&self.regs, &mut self.aperture, 0, PTE_TABLE_OFFSET)?;
+        program_identity_context(&self.regs, &mut self.aperture, 1, PTE1_TABLE_OFFSET)?;
+        vm::program_l1_l2(&self.regs);
+        vm::invalidate(&self.regs, hqd::VMID_0);
+        vm::invalidate(&self.regs, hqd::VMID_0 + 1);
         Ok(())
     }
 
@@ -278,7 +361,6 @@ impl CpQueue {
         for word in &firmware.words {
             self.regs.write_reg_direct(data_reg, *word);
         }
-        self.regs.write_reg_direct(addr_reg, firmware.version);
         let mut readback = Vec::with_capacity(firmware.words.len());
         for index in 0..firmware.words.len() {
             self.regs.write_reg_direct(addr_reg, index as u32);
@@ -311,14 +393,130 @@ impl CpQueue {
         Ok(())
     }
 
-    fn setup_vm(&mut self) -> io::Result<()> {
-        program_vm0(&self.regs, &mut self.aperture)
+    pub fn open_queue(
+        &mut self,
+        slot: usize,
+        vmid: u32,
+        priority: QueuePriority,
+    ) -> io::Result<()> {
+        if slot >= QUEUE_SLOTS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slot must be 0..7",
+            ));
+        }
+        if self.queues.iter().any(|queue| queue.slot == slot) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slot is already open",
+            ));
+        }
+        let (me, pipe, queue_id, doorbell_index) = slot_engine(slot);
+        if me == 2 && !self.mec2_loaded {
+            return Err(io::Error::other("slots 4..7 need mec2 firmware"));
+        }
+        let ring_va = slot_ring_va(slot);
+        let meta_va = slot_meta_va(slot);
+        let rptr_addr = meta_va + RPTR_REPORT_OFFSET as u64;
+        let wptr_addr = meta_va + WPTR_POLL_OFFSET as u64;
+
+        {
+            let words = self.aperture.words_mut();
+            let shadow_first = ((MQD_SHADOW_OFFSET - VRAM_BASE) / 4) as usize;
+            let shadow_last = shadow_first + MQD_SHADOW_BYTES / 4;
+            let ring_first = ((ring_va - VRAM_BASE) / 4) as usize;
+            let ring_last = ring_first + RING_BYTES / 4;
+            let meta_first = ((meta_va - VRAM_BASE) / 4) as usize;
+            let meta_last = meta_first + SLOT_META_STRIDE as usize / 4;
+            for word in words[shadow_first..shadow_last].iter_mut() {
+                *word = 0;
+            }
+            for word in words[ring_first..ring_last].iter_mut() {
+                *word = 0;
+            }
+            for word in words[meta_first..meta_last].iter_mut() {
+                *word = 0;
+            }
+        }
+
+        self.acquire_queue(me, pipe, queue_id, vmid);
+        self.deactivate_hqd()?;
+
+        let r = &self.regs;
+        r.write_reg_direct(
+            hqd::CP_MQD_BASE_ADDR,
+            hqd::byte_addr_word(MQD_SHADOW_OFFSET),
+        );
+        r.write_reg_direct(
+            hqd::CP_MQD_BASE_ADDR_HI,
+            hqd::byte_addr_hi_word(MQD_SHADOW_OFFSET),
+        );
+        r.write_reg_direct(hqd::CP_HQD_ACTIVE, 0);
+        r.write_reg_direct(hqd::CP_HQD_VMID, vmid);
+        let current = r.read_reg_direct(hqd::CP_HQD_PERSISTENT_STATE);
+        r.write_reg_direct(hqd::CP_HQD_PERSISTENT_STATE, hqd::persistent_state(current));
+        r.write_reg_direct(hqd::CP_HQD_PIPE_PRIORITY, priority.pipe);
+        r.write_reg_direct(hqd::CP_HQD_QUEUE_PRIORITY, priority.queue);
+        r.write_reg_direct(hqd::CP_HQD_QUANTUM, hqd::quantum());
+        r.write_reg_direct(hqd::CP_HQD_PQ_BASE, hqd::pq_base_word(ring_va));
+        r.write_reg_direct(hqd::CP_HQD_PQ_BASE_HI, hqd::pq_base_hi_word(ring_va));
+        r.write_reg_direct(
+            hqd::CP_HQD_PQ_RPTR_REPORT_ADDR,
+            hqd::byte_addr_word(rptr_addr),
+        );
+        r.write_reg_direct(
+            hqd::CP_HQD_PQ_RPTR_REPORT_ADDR_HI,
+            hqd::byte_addr_hi_word(rptr_addr),
+        );
+        r.write_reg_direct(
+            hqd::CP_HQD_PQ_WPTR_POLL_ADDR,
+            hqd::byte_addr_word(wptr_addr),
+        );
+        r.write_reg_direct(
+            hqd::CP_HQD_PQ_WPTR_POLL_ADDR_HI,
+            hqd::byte_addr_hi_word(wptr_addr),
+        );
+        r.write_reg_direct(
+            hqd::CP_HQD_PQ_DOORBELL_CONTROL,
+            hqd::doorbell_control(doorbell_index),
+        );
+        r.write_reg_direct(hqd::CP_HQD_PQ_WPTR, 0);
+        r.write_reg_direct(
+            hqd::CP_HQD_PQ_CONTROL,
+            hqd::pq_control(RING_BYTES as u32 / 4),
+        );
+        r.write_reg_direct(hqd::CP_HQD_IB_BASE_ADDR, 0);
+        r.write_reg_direct(hqd::CP_HQD_IB_BASE_ADDR_HI, 0);
+        r.write_reg_direct(hqd::CP_HQD_IB_RPTR, 0);
+        let current = r.read_reg_direct(hqd::CP_HQD_IB_CONTROL);
+        r.write_reg_direct(hqd::CP_HQD_IB_CONTROL, hqd::ib_control(current));
+        let current = r.read_reg_direct(hqd::CP_HQD_IQ_TIMER);
+        r.write_reg_direct(hqd::CP_HQD_IQ_TIMER, hqd::iq_timer(current));
+        let current = r.read_reg_direct(hqd::CP_HQD_CTX_SAVE_CONTROL);
+        r.write_reg_direct(hqd::CP_HQD_CTX_SAVE_CONTROL, hqd::ctx_save_control(current));
+        let current = r.read_reg_direct(hqd::CP_MQD_CONTROL);
+        r.write_reg_direct(hqd::CP_MQD_CONTROL, hqd::mqd_control(current));
+        r.write_reg_direct(hqd::CP_HQD_ACTIVE, hqd::CP_HQD_ACTIVE_BIT);
+        self.release_queue();
+
+        self.queues.push(QueueState {
+            slot,
+            me,
+            pipe,
+            queue: queue_id,
+            vmid,
+            priority,
+            ring_dw: RING_BYTES / 4,
+            doorbell_index,
+            wp: 0,
+        });
+        Ok(())
     }
 
-    fn acquire_queue(&mut self) {
+    fn acquire_queue(&mut self, me: u32, pipe: u32, queue: u32, vmid: u32) {
         self.regs.write_reg_direct(
             hqd::SRBM_GFX_CNTL,
-            hqd::srbm_gfx_cntl(hqd::MEC_ME1, hqd::PIPE_0, hqd::QUEUE_0, hqd::VMID_0),
+            hqd::srbm_gfx_cntl(me, pipe, queue, vmid),
         );
     }
 
@@ -344,88 +542,6 @@ impl CpQueue {
         Ok(())
     }
 
-    fn program_hqd(&mut self) -> io::Result<()> {
-        let ring_va = RING_OFFSET;
-        let meta_va = META_OFFSET;
-        let rptr_addr = meta_va + RPTR_REPORT_OFFSET as u64;
-        let wptr_addr = meta_va + WPTR_POLL_OFFSET as u64;
-
-        let words = self.aperture.words_mut();
-        let shadow_first = ((MQD_SHADOW_OFFSET - VRAM_BASE) / 4) as usize;
-        let shadow_last = shadow_first + MQD_SHADOW_BYTES / 4;
-        let ring_first = ((RING_OFFSET - VRAM_BASE) / 4) as usize;
-        let ring_last = ring_first + RING_BYTES / 4;
-        let meta_first = ((META_OFFSET - VRAM_BASE) / 4) as usize;
-        let meta_last = meta_first + 1024;
-        for word in words[ring_first..ring_last].iter_mut() {
-            *word = 0;
-        }
-        for word in words[shadow_first..shadow_last].iter_mut() {
-            *word = 0;
-        }
-        for word in words[meta_first..meta_last].iter_mut() {
-            *word = 0;
-        }
-
-        self.acquire_queue();
-        self.deactivate_hqd()?;
-
-        let r = &self.regs;
-        r.write_reg_direct(
-            hqd::CP_MQD_BASE_ADDR,
-            hqd::byte_addr_word(MQD_SHADOW_OFFSET),
-        );
-        r.write_reg_direct(
-            hqd::CP_MQD_BASE_ADDR_HI,
-            hqd::byte_addr_hi_word(MQD_SHADOW_OFFSET),
-        );
-        r.write_reg_direct(hqd::CP_HQD_ACTIVE, 0);
-        r.write_reg_direct(hqd::CP_HQD_VMID, hqd::VMID_0);
-        let current = r.read_reg_direct(hqd::CP_HQD_PERSISTENT_STATE);
-        r.write_reg_direct(hqd::CP_HQD_PERSISTENT_STATE, hqd::persistent_state(current));
-        r.write_reg_direct(hqd::CP_HQD_PIPE_PRIORITY, 0);
-        r.write_reg_direct(hqd::CP_HQD_QUEUE_PRIORITY, 0);
-        r.write_reg_direct(hqd::CP_HQD_QUANTUM, hqd::quantum());
-        r.write_reg_direct(hqd::CP_HQD_PQ_BASE, hqd::pq_base_word(ring_va));
-        r.write_reg_direct(hqd::CP_HQD_PQ_BASE_HI, hqd::pq_base_hi_word(ring_va));
-        r.write_reg_direct(
-            hqd::CP_HQD_PQ_RPTR_REPORT_ADDR,
-            hqd::byte_addr_word(rptr_addr),
-        );
-        r.write_reg_direct(
-            hqd::CP_HQD_PQ_RPTR_REPORT_ADDR_HI,
-            hqd::byte_addr_hi_word(rptr_addr),
-        );
-        r.write_reg_direct(
-            hqd::CP_HQD_PQ_WPTR_POLL_ADDR,
-            hqd::byte_addr_word(wptr_addr),
-        );
-        r.write_reg_direct(
-            hqd::CP_HQD_PQ_WPTR_POLL_ADDR_HI,
-            hqd::byte_addr_hi_word(wptr_addr),
-        );
-        r.write_reg_direct(
-            hqd::CP_HQD_PQ_DOORBELL_CONTROL,
-            hqd::doorbell_control(self.doorbell_index),
-        );
-        r.write_reg_direct(hqd::CP_HQD_PQ_WPTR, 0);
-        r.write_reg_direct(hqd::CP_HQD_PQ_CONTROL, hqd::pq_control(self.ring_dw as u32));
-        r.write_reg_direct(hqd::CP_HQD_IB_BASE_ADDR, 0);
-        r.write_reg_direct(hqd::CP_HQD_IB_BASE_ADDR_HI, 0);
-        r.write_reg_direct(hqd::CP_HQD_IB_RPTR, 0);
-        let current = r.read_reg_direct(hqd::CP_HQD_IB_CONTROL);
-        r.write_reg_direct(hqd::CP_HQD_IB_CONTROL, hqd::ib_control(current));
-        let current = r.read_reg_direct(hqd::CP_HQD_IQ_TIMER);
-        r.write_reg_direct(hqd::CP_HQD_IQ_TIMER, hqd::iq_timer(current));
-        let current = r.read_reg_direct(hqd::CP_HQD_CTX_SAVE_CONTROL);
-        r.write_reg_direct(hqd::CP_HQD_CTX_SAVE_CONTROL, hqd::ctx_save_control(current));
-        let current = r.read_reg_direct(hqd::CP_MQD_CONTROL);
-        r.write_reg_direct(hqd::CP_MQD_CONTROL, hqd::mqd_control(current));
-        r.write_reg_direct(hqd::CP_HQD_ACTIVE, hqd::CP_HQD_ACTIVE_BIT);
-        self.release_queue();
-        Ok(())
-    }
-
     pub fn load_kernel(&mut self, words: &[u32]) -> io::Result<()> {
         let aperture = self.aperture.words_mut();
         let first = ((KERNEL_OFFSET - VRAM_BASE) / 4) as usize;
@@ -440,29 +556,16 @@ impl CpQueue {
         Ok(())
     }
 
-    fn dispatch_packets(plan: &DispatchPlan) -> Vec<u32> {
-        let mut builder = PacketBuilder::new();
-        for reg in [
-            regs::COMPUTE_STATIC_THREAD_MGMT_SE0,
-            regs::COMPUTE_STATIC_THREAD_MGMT_SE1,
-            regs::COMPUTE_STATIC_THREAD_MGMT_SE2,
-            regs::COMPUTE_STATIC_THREAD_MGMT_SE3,
-        ] {
-            builder.set_sh_reg(regs::sh_offset(reg), &[0xFFFF_FFFF]);
-        }
-        dispatch::push(&mut builder, plan);
-        builder.into_words()
-    }
-
-    pub fn dispatch_stream(&mut self, grid: [u32; 3], group: [u32; 3]) -> Vec<u32> {
-        let plan = dispatch_plan(grid, group);
+    pub fn dispatch_stream(&mut self, slot: usize, grid: [u32; 3], group: [u32; 3]) -> Vec<u32> {
+        let payload_va = slot_meta_va(slot);
+        let plan = dispatch_plan_for(grid, group, payload_va);
         let descriptor = isa::buffer_descriptor(plan.output_va, 0, 4);
         {
             let aperture = self.aperture.words_mut();
-            let first = ((META_OFFSET - VRAM_BASE) / 4) as usize + KERNARG_OFFSET / 4;
+            let first = ((payload_va - VRAM_BASE) / 4) as usize + KERNARG_OFFSET / 4;
             aperture[first..first + 4].copy_from_slice(&descriptor);
         }
-        Self::dispatch_packets(&plan)
+        device_packets(&plan)
     }
 
     pub fn alloc_gtt(&mut self, pages: usize) -> io::Result<GttBuffer> {
@@ -472,37 +575,54 @@ impl CpQueue {
         }
         let host = HostBuffer::lock(pages)?;
         let first_page_index = (GTT_BASE_VA / vm::GPU_PAGE_BYTES) as u32 + self.gtt_cursor;
-        vm::fill_system_entries(
-            &mut self.aperture,
-            (PTE_TABLE_OFFSET - VRAM_BASE) as usize,
-            first_page_index,
-            host.pfns(),
-        )?;
+        for table_offset in [PTE_TABLE_OFFSET, PTE1_TABLE_OFFSET] {
+            vm::fill_system_entries(
+                &mut self.aperture,
+                (table_offset - VRAM_BASE) as usize,
+                first_page_index,
+                host.pfns(),
+            )?;
+        }
         self.gtt_cursor += pages as u32;
         hdp::invalidate_with_flush(&self.regs, hqd::VMID_0);
+        hdp::invalidate_with_flush(&self.regs, hqd::VMID_0 + 1);
         Ok(GttBuffer {
             host,
             va: first_page_index as u64 * vm::GPU_PAGE_BYTES,
         })
     }
 
-    pub fn submit(&mut self, packets: &[u32]) -> io::Result<()> {
+    pub fn submit(&mut self, slot: usize, packets: &[u32]) -> io::Result<()> {
+        let state = self
+            .queues
+            .iter()
+            .find(|queue| queue.slot == slot)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "slot is not open"))?;
+        let ring_va = slot_ring_va(slot);
+        let doorbell_index = state.doorbell_index;
+        let wp = state.wp;
         let aperture = self.aperture.words_mut();
-        let first = ((RING_OFFSET - VRAM_BASE) / 4) as usize;
-        let ring = &mut aperture[first..first + self.ring_dw];
-        let next = write_packet(ring, self.wp, packets).ok_or_else(|| {
+        let first = ((ring_va - VRAM_BASE) / 4) as usize;
+        let ring = &mut aperture[first..first + RING_BYTES / 4];
+        let next = write_packet(ring, wp, packets).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "packet does not fit the ring")
         })?;
-        self.wp = next;
         hdp::flush(&self.regs);
         self.regs
             .bar()
-            .write_u32(self.doorbell_index as usize * 4, self.wp as u32);
+            .write_u32(doorbell_index as usize * 4, next as u32);
+        if let Some(state) = self.queues.iter_mut().find(|queue| queue.slot == slot) {
+            state.wp = next;
+        }
         Ok(())
     }
 
-    pub fn write_pointer_dw(&self) -> u32 {
-        self.wp as u32
+    pub fn write_pointer_dw(&self, slot: usize) -> u32 {
+        self.queues
+            .iter()
+            .find(|queue| queue.slot == slot)
+            .map(|queue| queue.wp as u32)
+            .unwrap_or(0)
     }
 
     pub fn read_reg(&self, offset: u32) -> u32 {
@@ -517,20 +637,20 @@ impl CpQueue {
         power::enable_pg(&self.regs);
     }
 
-    pub fn read_pointer_dw(&self) -> u32 {
+    pub fn read_pointer_dw(&self, slot: usize) -> u32 {
         self.aperture
-            .read_u32((META_OFFSET - VRAM_BASE) as usize + RPTR_REPORT_OFFSET)
+            .read_u32((slot_meta_va(slot) - VRAM_BASE) as usize + RPTR_REPORT_OFFSET)
     }
 
-    pub fn meta_u32(&self, offset: usize) -> u32 {
+    pub fn meta_u32(&self, slot: usize, offset: usize) -> u32 {
         self.aperture
-            .read_u32((META_OFFSET - VRAM_BASE) as usize + offset)
+            .read_u32((slot_meta_va(slot) - VRAM_BASE) as usize + offset)
     }
 
-    pub fn wait_fence(&self, timeout: Duration) -> io::Result<u32> {
+    pub fn wait_fence(&self, slot: usize, timeout: Duration) -> io::Result<u32> {
         let started = Instant::now();
         loop {
-            let fence = self.meta_u32(FENCE_OFFSET);
+            let fence = self.meta_u32(slot, FENCE_OFFSET);
             if fence == FENCE_MAGIC {
                 return Ok(fence);
             }
@@ -538,7 +658,7 @@ impl CpQueue {
                 return Err(io::Error::other(format!(
                     "fence timeout after {}ms, rptr report {} dwords\n{}",
                     started.elapsed().as_millis(),
-                    self.read_pointer_dw(),
+                    self.read_pointer_dw(slot),
                     self.status_report()
                 )));
             }
@@ -551,9 +671,18 @@ impl CpQueue {
     }
 
     pub fn destroy(&mut self) -> io::Result<()> {
-        self.acquire_queue();
-        let result = self.deactivate_hqd();
-        self.release_queue();
+        let slots: Vec<(u32, u32, u32, u32)> = self
+            .queues
+            .iter()
+            .map(|queue| (queue.me, queue.pipe, queue.queue, queue.vmid))
+            .collect();
+        for (me, pipe, queue, vmid) in slots {
+            self.acquire_queue(me, pipe, queue, vmid);
+            let result = self.deactivate_hqd();
+            self.release_queue();
+            result?;
+        }
+        self.queues.clear();
         self.regs.write_reg_direct(
             hqd::CP_MEC_CNTL,
             hqd::CP_MEC_CNTL_ME1_HALT | hqd::CP_MEC_CNTL_ME2_HALT,
@@ -561,11 +690,11 @@ impl CpQueue {
         power::cg_off(&self.regs);
         rlc::stop(&self.regs);
         self.destroyed = true;
-        result
+        Ok(())
     }
 }
 
-impl Drop for CpQueue {
+impl Drop for CpDevice {
     fn drop(&mut self) {
         if !self.destroyed {
             let _ = self.destroy();
@@ -583,25 +712,34 @@ mod tests {
             assert!(RING_BYTES.is_power_of_two());
             assert!(PTE_TABLE_BYTES == 8192 * 8);
             assert!(VRAM_BASE.is_multiple_of(4096));
-            assert!(META_OFFSET.is_multiple_of(4096));
             assert!(KERNEL_OFFSET.is_multiple_of(4096));
             assert!(PTE_TABLE_OFFSET.is_multiple_of(4096));
+            assert!(PTE1_TABLE_OFFSET.is_multiple_of(4096));
             assert!(DEFAULT_PAGE_OFFSET.is_multiple_of(4096));
             assert!(LAYOUT_END <= VRAM_BASE + VM_WINDOW_BYTES);
             assert!(MQD_SHADOW_OFFSET + MQD_SHADOW_BYTES as u64 <= PTE_TABLE_OFFSET);
-            assert!(PTE_TABLE_OFFSET + PTE_TABLE_BYTES as u64 <= CSB_OFFSET);
-            assert!(CSB_OFFSET + CSB_BYTES as u64 <= META_OFFSET);
-            assert!(META_OFFSET + 4096 <= KERNEL_OFFSET);
+            assert!(PTE_TABLE_OFFSET + PTE_TABLE_BYTES as u64 <= PTE1_TABLE_OFFSET);
+            assert!(PTE1_TABLE_OFFSET + PTE_TABLE_BYTES as u64 <= CSB_OFFSET);
+            assert!(CSB_OFFSET + CSB_BYTES as u64 <= KERNEL_OFFSET);
             assert!(DEFAULT_PAGE_OFFSET + 4096 <= VRAM_BASE + VM_WINDOW_BYTES);
-            assert!(PTE_TABLE_BYTES == 8192 * 8);
             assert!(LAYOUT_END <= GTT_BASE_VA);
+            assert!(GFX_LAYOUT_END <= GTT_BASE_VA);
             assert!(csb::CSB_WORDS * 4 <= CSB_BYTES);
         };
-        assert_eq!(CSB_OFFSET, 0x0401_2000);
-        assert_eq!(META_OFFSET, 0x0401_4000);
-        assert_eq!(KERNEL_OFFSET, 0x0401_5000);
-        assert_eq!(DEFAULT_PAGE_OFFSET, 0x0401_6000);
-        assert_eq!(LAYOUT_END, 0x0401_7000);
+        assert_eq!(MQD_SHADOW_OFFSET, 0x0400_8000);
+        assert_eq!(PTE_TABLE_OFFSET, 0x0400_9000);
+        assert_eq!(PTE1_TABLE_OFFSET, 0x0401_9000);
+        assert_eq!(CSB_OFFSET, 0x0402_9000);
+        assert_eq!(KERNEL_OFFSET, 0x0402_B000);
+        assert_eq!(DEFAULT_PAGE_OFFSET, 0x0402_C000);
+        assert_eq!(LAYOUT_END, 0x0402_D000);
+        assert_eq!(SLOT_META_OFFSET, 0x0402_D000);
+        assert_eq!(SDMA_RING_OFFSET, 0x0403_5000);
+        assert_eq!(SDMA_META_OFFSET, 0x0403_9000);
+        assert_eq!(SDMA_LAYOUT_END, 0x0403_B000);
+        assert_eq!(GFX_RING_OFFSET, 0x0403_B000);
+        assert_eq!(GFX_META_OFFSET, 0x0403_C000);
+        assert_eq!(GFX_LAYOUT_END, 0x0403_D000);
     }
 
     #[test]
@@ -614,41 +752,54 @@ mod tests {
         let end_pfn =
             ((VRAM_BASE + VM_WINDOW_BYTES + GTT_WINDOW_BYTES) / vm::GPU_PAGE_BYTES) as u32 - 1;
         assert_eq!(end_pfn, 0x5000 + 4096 - 1);
-        assert_eq!(LAYOUT_END / vm::GPU_PAGE_BYTES, 0x4017);
+        assert_eq!(LAYOUT_END / vm::GPU_PAGE_BYTES, 0x402D);
     }
 
     #[test]
-    fn plan_addresses_point_into_layout() {
-        let plan = dispatch_plan([1, 1, 1], [64, 1, 1]);
+    fn plan_addresses_point_into_slot_meta() {
+        let plan = dispatch_plan_for([1, 1, 1], [64, 1, 1], slot_meta_va(2));
         assert_eq!(plan.kernel_va, KERNEL_OFFSET);
-        assert_eq!(plan.kernarg_va, META_OFFSET + KERNARG_OFFSET as u64);
-        assert_eq!(plan.fence_va, META_OFFSET + FENCE_OFFSET as u64);
-        assert_eq!(plan.output_va, META_OFFSET + OUTPUT_OFFSET as u64);
-        assert!(plan.kernarg_va < plan.kernel_va);
+        assert_eq!(plan.kernarg_va, slot_meta_va(2) + KERNARG_OFFSET as u64);
+        assert_eq!(plan.fence_va, slot_meta_va(2) + FENCE_OFFSET as u64);
+        assert_eq!(plan.output_va, slot_meta_va(2) + OUTPUT_OFFSET as u64);
+        assert!(plan.kernarg_va >= SLOT_META_OFFSET);
+        assert!(plan.output_va < slot_meta_va(2) + SLOT_META_STRIDE);
     }
 
     #[test]
     fn vm_config_matches_layout_pages() {
-        assert_eq!(PTE_TABLE_OFFSET / vm::GPU_PAGE_BYTES, 0x4002);
-        assert_eq!(CSB_OFFSET / vm::GPU_PAGE_BYTES, 0x4012);
-        assert_eq!(META_OFFSET / vm::GPU_PAGE_BYTES, 0x4014);
-        assert_eq!(KERNEL_OFFSET / vm::GPU_PAGE_BYTES, 0x4015);
-        assert_eq!(DEFAULT_PAGE_OFFSET / vm::GPU_PAGE_BYTES, 0x4016);
+        assert_eq!(PTE_TABLE_OFFSET / vm::GPU_PAGE_BYTES, 0x4009);
+        assert_eq!(PTE1_TABLE_OFFSET / vm::GPU_PAGE_BYTES, 0x4019);
+        assert_eq!(CSB_OFFSET / vm::GPU_PAGE_BYTES, 0x4029);
+        assert_eq!(KERNEL_OFFSET / vm::GPU_PAGE_BYTES, 0x402B);
+        assert_eq!(DEFAULT_PAGE_OFFSET / vm::GPU_PAGE_BYTES, 0x402C);
         assert_eq!(VRAM_BASE / vm::GPU_PAGE_BYTES, 0x4000);
+    }
+
+    #[test]
+    fn slot_engine_maps_mec_pipe_and_doorbell() {
+        assert_eq!(slot_engine(0), (1, 0, 0, hqd::DOORBELL_MEC_RING0));
+        assert_eq!(slot_engine(3), (1, 3, 0, hqd::DOORBELL_MEC_RING0 + 3));
+        assert_eq!(slot_engine(4), (2, 0, 0, hqd::DOORBELL_MEC_RING0 + 4));
+        assert_eq!(slot_engine(7), (2, 3, 0, hqd::DOORBELL_MEC_RING7));
+    }
+
+    #[test]
+    fn slot_meta_regions_do_not_overlap_rings() {
+        for slot in 0..QUEUE_SLOTS {
+            let ring = slot_ring_va(slot);
+            let meta = slot_meta_va(slot);
+            assert!(ring < PTE_TABLE_OFFSET);
+            assert!(meta >= LAYOUT_END);
+            assert!(meta + SLOT_META_STRIDE <= SDMA_RING_OFFSET);
+        }
     }
 
     #[test]
     fn stream_va_targets_payload_window() {
         let stream = dispatch_stream_va([1, 1, 1], [64, 1, 1], GTT_BASE_VA);
-        let plan = DispatchPlan {
-            kernel_va: KERNEL_OFFSET,
-            kernarg_va: GTT_BASE_VA + KERNARG_OFFSET as u64,
-            fence_va: GTT_BASE_VA + FENCE_OFFSET as u64,
-            output_va: GTT_BASE_VA + OUTPUT_OFFSET as u64,
-            grid: [1, 1, 1],
-            group: [64, 1, 1],
-        };
-        assert_eq!(stream, CpQueue::dispatch_packets(&plan));
+        let plan = dispatch_plan_for([1, 1, 1], [64, 1, 1], GTT_BASE_VA);
+        assert_eq!(stream, device_packets(&plan));
         assert_eq!(stream[29], (GTT_BASE_VA + KERNARG_OFFSET as u64) as u32);
         assert_eq!(stream[38], (GTT_BASE_VA + FENCE_OFFSET as u64) as u32);
     }

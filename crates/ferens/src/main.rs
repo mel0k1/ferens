@@ -13,9 +13,9 @@ use ferens_gfx8::isa;
 use ferens_gfx8::pm4::PacketBuilder;
 use ferens_gfx8::regs;
 use ferens_kfd::{Allocator, ComputeQueue, Device, GPU_PAGE_BYTES};
-use ferens_mmio::{CpQueue, Sdma};
+use ferens_mmio::{CpDevice, GfxRing, QueuePriority, Sdma};
 
-const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens status | ferens sdma-copy [bytes]";
+const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens queues | ferens gfx-ring | ferens status | ferens sdma-copy [bytes]";
 
 const RING_BYTES: usize = 4096;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +32,8 @@ fn main() {
         Some("dispatch-gtt") => run_dispatch_gtt(),
         Some("status") => run_status(),
         Some("sdma-copy") => run_sdma_copy(args.get(1).map(String::as_str)),
+        Some("queues") => run_queues(),
+        Some("gfx-ring") => run_gfx_ring(),
         _ => eprintln!("{USAGE}"),
     }
 }
@@ -150,6 +152,92 @@ fn run_sdma_copy(arg: Option<&str>) {
     }
 }
 
+fn run_queues() {
+    if let Err(error) = queues_live() {
+        eprintln!("queues failed: {error}");
+    }
+}
+
+fn run_gfx_ring() {
+    if let Err(error) = gfx_ring_live() {
+        eprintln!("gfx-ring failed: {error}");
+    }
+}
+
+fn gfx_ring_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let mut gfx = GfxRing::open(&slot_dir, device.chip)?;
+    println!(
+        "gfx fw pfp {:#08x} / ce {:#08x} / me {:#08x}, ring {} bytes in vram, kick via mmio wptr",
+        gfx.fw_versions[0],
+        gfx.fw_versions[1],
+        gfx.fw_versions[2],
+        ferens_mmio::GFX_RING_BYTES
+    );
+    let fence = gfx.ring_test()?;
+    println!("fence {fence:#x} written by gfx ring through vram");
+    println!("{}", gfx.status().report());
+    gfx.destroy()?;
+    Ok(())
+}
+
+fn queues_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let mut device_obj = CpDevice::create(&slot_dir, device.chip)?;
+    println!(
+        "mec fw 0x{:08x}, rlc fw 0x{:08x}, mec2 {}, vm contexts 2",
+        device_obj.mec_fw_version, device_obj.rlc_fw_version, device_obj.mec2_loaded
+    );
+    device_obj.open_queue(0, 0, QueuePriority::normal())?;
+    device_obj.open_queue(1, 1, QueuePriority::high())?;
+    device_obj.load_kernel(&isa::KERNEL_WORDS)?;
+    for slot in 0..2 {
+        let (me, pipe, queue, doorbell) = ferens_mmio::slot_engine(slot);
+        println!(
+            "queue slot {slot}: me{me} pipe{pipe} queue{queue}, doorbell slot {doorbell:#x}, vmid {slot}, priority {}",
+            if slot == 1 { "high" } else { "normal" }
+        );
+    }
+    let stream0 = device_obj.dispatch_stream(0, [1, 1, 1], [64, 1, 1]);
+    let stream1 = device_obj.dispatch_stream(1, [1, 1, 1], [64, 1, 1]);
+    println!("streams {} + {} dwords", stream0.len(), stream1.len());
+    device_obj.submit(0, &stream0)?;
+    device_obj.submit(1, &stream1)?;
+    for slot in 0..2 {
+        let started = Instant::now();
+        let fence = device_obj.wait_fence(slot, FENCE_TIMEOUT)?;
+        println!(
+            "slot {slot} fence {fence:#x} after {}ms, data[0] {:#010x} (kernel writes {:#010x})",
+            started.elapsed().as_millis(),
+            device_obj.meta_u32(slot, OUTPUT_OFFSET),
+            isa::KERNEL_MAGIC
+        );
+    }
+    println!(
+        "ring wp: slot0 {} dwords, slot1 {} dwords",
+        device_obj.write_pointer_dw(0),
+        device_obj.write_pointer_dw(1)
+    );
+    device_obj.destroy()?;
+    Ok(())
+}
+
 fn sdma_copy_live(arg: Option<&str>) -> io::Result<()> {
     let bytes: usize = match arg {
         Some(text) => text.parse().map_err(|_| {
@@ -247,7 +335,7 @@ fn gate_live(with_pg: bool) -> io::Result<()> {
         device.revision
     );
     let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
-    let mut queue = CpQueue::create(&slot_dir, device.chip)?;
+    let mut queue = CpDevice::create(&slot_dir, device.chip)?;
     println!(
         "mec fw 0x{:08x}, rlc fw 0x{:08x}, mec2 {}, csb+srm {}",
         queue.mec_fw_version, queue.rlc_fw_version, queue.mec2_loaded, queue.pg_initialized
@@ -280,7 +368,8 @@ fn dispatch_gtt_live() -> io::Result<()> {
         device.revision
     );
     let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
-    let mut queue = CpQueue::create(&slot_dir, device.chip)?;
+    let mut queue = CpDevice::create(&slot_dir, device.chip)?;
+    queue.open_queue(0, 0, QueuePriority::normal())?;
     println!(
         "mec fw 0x{:08x}, rlc fw 0x{:08x}, mec2 {}, csb+srm {}",
         queue.mec_fw_version, queue.rlc_fw_version, queue.mec2_loaded, queue.pg_initialized
@@ -303,7 +392,7 @@ fn dispatch_gtt_live() -> io::Result<()> {
     buffer.host.write_u32(FENCE_OFFSET, 0);
     let stream = ferens_mmio::dispatch_stream_va([1, 1, 1], [64, 1, 1], buffer.va);
     println!("stream {} dwords", stream.len());
-    queue.submit(&stream)?;
+    queue.submit(0, &stream)?;
 
     let started = Instant::now();
     let mut fence = buffer.host.read_u32(FENCE_OFFSET);
@@ -317,7 +406,7 @@ fn dispatch_gtt_live() -> io::Result<()> {
         return Err(io::Error::other(format!(
             "fence timeout after {}ms, rptr report {} dwords\n{report}",
             started.elapsed().as_millis(),
-            queue.read_pointer_dw()
+            queue.read_pointer_dw(0)
         )));
     }
     println!("fence {fence:#x} after {}ms", started.elapsed().as_millis());
@@ -340,32 +429,33 @@ fn dispatch_mmio_live() -> io::Result<()> {
         device.revision
     );
     let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
-    let mut queue = CpQueue::create(&slot_dir, device.chip)?;
+    let mut queue = CpDevice::create(&slot_dir, device.chip)?;
+    queue.open_queue(0, 0, QueuePriority::normal())?;
     println!(
-        "mec fw 0x{:08x}, rlc fw 0x{:08x}, mec2 {}, ring {} dwords, queue me1 pipe0 queue0, doorbell slot {:#x}",
+        "mec fw 0x{:08x}, rlc fw 0x{:08x}, mec2 {}, ring {} dwords, slot 0 me1 pipe0 queue0, doorbell slot {:#x}",
         queue.mec_fw_version,
         queue.rlc_fw_version,
         queue.mec2_loaded,
-        queue.ring_dw,
-        queue.doorbell_index
+        ferens_mmio::RING_BYTES / 4,
+        ferens_mmio::slot_engine(0).3
     );
     queue.load_kernel(&isa::KERNEL_WORDS)?;
-    let stream = queue.dispatch_stream([1, 1, 1], [64, 1, 1]);
+    let stream = queue.dispatch_stream(0, [1, 1, 1], [64, 1, 1]);
     println!("stream {} dwords", stream.len());
-    queue.submit(&stream)?;
+    queue.submit(0, &stream)?;
 
     let started = Instant::now();
-    let fence = queue.wait_fence(FENCE_TIMEOUT)?;
+    let fence = queue.wait_fence(0, FENCE_TIMEOUT)?;
     println!("fence {fence:#x} after {}ms", started.elapsed().as_millis());
     println!(
         "data[0] {:#010x}, kernel writes {:#010x}",
-        queue.meta_u32(OUTPUT_OFFSET),
+        queue.meta_u32(0, OUTPUT_OFFSET),
         isa::KERNEL_MAGIC
     );
     println!(
         "ring: wp {} dwords, rptr report {} dwords",
-        queue.write_pointer_dw(),
-        queue.read_pointer_dw()
+        queue.write_pointer_dw(0),
+        queue.read_pointer_dw(0)
     );
     queue.destroy()?;
     Ok(())
