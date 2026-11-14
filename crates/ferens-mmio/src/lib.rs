@@ -1,17 +1,24 @@
 pub mod csb;
 pub mod csb_data;
+pub mod fault;
 pub mod fw;
+pub mod golden;
+pub mod golden_data;
 pub mod gtt;
+pub mod hdp;
 pub mod hqd;
+pub mod iommu;
 pub mod power;
 pub mod queue;
 pub mod rlc;
 pub mod vm;
 
+pub use fault::{snapshot, Status};
 pub use fw::{
-    load, parse_gfx_firmware, parse_rlc_firmware, parse_rlc_register_list, FirmwareSet,
+    crc32, load, parse_gfx_firmware, parse_rlc_firmware, parse_rlc_register_list, FirmwareSet,
     RlcRegisterList, UcodeFirmware, FIRMWARE_DIR,
 };
+pub use golden::{apply, program, GoldenEntry};
 pub use gtt::{pagemap_offset, parse_pagemap_entry, HostBuffer};
 pub use hqd::{
     doorbell_control, persistent_state, pq_base_hi_word, pq_base_word, pq_control, quantum,

@@ -85,6 +85,23 @@ pub fn load_ucode<B: BarOps>(regs: &Mmio<B>, firmware: &UcodeFirmware) {
     regs.write_reg_direct(RLC_GPM_UCODE_ADDR, firmware.version);
 }
 
+pub fn verify_ucode<B: BarOps>(regs: &Mmio<B>, firmware: &UcodeFirmware) -> io::Result<()> {
+    let mut readback = Vec::with_capacity(firmware.words.len());
+    for index in 0..firmware.words.len() {
+        regs.write_reg_direct(RLC_GPM_UCODE_ADDR, index as u32);
+        readback.push(regs.read_reg_direct(RLC_GPM_UCODE_DATA));
+    }
+    let expected = crate::fw::crc32(&firmware.words);
+    let actual = crate::fw::crc32(&readback);
+    if actual != expected {
+        return Err(io::Error::other(format!(
+            "rlc ucode readback crc mismatch: want {expected:#010x}, got {actual:#010x}"
+        )));
+    }
+    regs.write_reg_direct(RLC_GPM_UCODE_ADDR, firmware.version);
+    Ok(())
+}
+
 pub fn enable<B: BarOps>(regs: &Mmio<B>) {
     let ctrl = regs.read_reg_direct(RLC_CNTL);
     regs.write_reg_direct(
@@ -110,6 +127,7 @@ pub fn resume<B: BarOps>(
         power::init_pg(regs, setup)?;
     }
     load_ucode(regs, firmware);
+    verify_ucode(regs, firmware)?;
     enable(regs);
     Ok(())
 }
@@ -122,6 +140,8 @@ mod tests {
     struct FakeBar {
         cells: RefCell<Vec<u32>>,
         writes: RefCell<Vec<(usize, u32)>>,
+        sram: RefCell<Vec<u32>>,
+        cursor: std::cell::Cell<usize>,
     }
 
     impl FakeBar {
@@ -129,17 +149,29 @@ mod tests {
             Self {
                 cells: RefCell::new(vec![0; words]),
                 writes: RefCell::new(Vec::new()),
+                sram: RefCell::new(vec![0; words]),
+                cursor: std::cell::Cell::new(0),
             }
         }
     }
 
     impl BarOps for FakeBar {
         fn read_u32(&self, offset: usize) -> u32 {
+            if offset == RLC_GPM_UCODE_DATA as usize * 4 {
+                return self.sram.borrow()[self.cursor.get()];
+            }
             self.cells.borrow()[offset / 4]
         }
 
         fn write_u32(&self, offset: usize, value: u32) {
             self.writes.borrow_mut().push((offset, value));
+            if offset == RLC_GPM_UCODE_ADDR as usize * 4 {
+                self.cursor.set(value as usize);
+            } else if offset == RLC_GPM_UCODE_DATA as usize * 4 {
+                let cursor = self.cursor.get();
+                self.sram.borrow_mut()[cursor] = value;
+                self.cursor.set(cursor + 1);
+            }
             self.cells.borrow_mut()[offset / 4] = value;
         }
 
@@ -207,15 +239,33 @@ mod tests {
             words: vec![0xBEEF_0001, 0xBEEF_0002],
         };
         load_ucode(&mmio, &firmware);
+        verify_ucode(&mmio, &firmware).unwrap();
         assert_eq!(
             mmio.bar().writes.borrow().as_slice(),
             &[
                 (RLC_GPM_UCODE_ADDR as usize * 4, 0),
                 (RLC_GPM_UCODE_DATA as usize * 4, 0xBEEF_0001),
                 (RLC_GPM_UCODE_DATA as usize * 4, 0xBEEF_0002),
+                (RLC_GPM_UCODE_ADDR as usize * 4, 0x11E),
+                (RLC_GPM_UCODE_ADDR as usize * 4, 0),
+                (RLC_GPM_UCODE_ADDR as usize * 4, 1),
                 (RLC_GPM_UCODE_ADDR as usize * 4, 0x11E)
             ]
         );
+    }
+
+    #[test]
+    fn verify_ucode_rejects_sram_corruption() {
+        let mmio = Mmio::new(FakeBar::new(BAR_WORDS));
+        let firmware = UcodeFirmware {
+            version: 0x11E,
+            feature_version: 1,
+            words: vec![0xBEEF_0001, 0xBEEF_0002],
+        };
+        load_ucode(&mmio, &firmware);
+        mmio.bar().sram.borrow_mut()[0] = 0xDEAD_0001;
+        let error = verify_ucode(&mmio, &firmware).unwrap_err();
+        assert!(error.to_string().contains("crc mismatch"));
     }
 
     #[test]
@@ -268,6 +318,9 @@ mod tests {
             (RLC_GPM_UCODE_ADDR as usize * 4, 0),
             (RLC_GPM_UCODE_DATA as usize * 4, 0xBEEF_0001),
             (RLC_GPM_UCODE_DATA as usize * 4, 0xBEEF_0002),
+            (RLC_GPM_UCODE_ADDR as usize * 4, 0x11E),
+            (RLC_GPM_UCODE_ADDR as usize * 4, 0),
+            (RLC_GPM_UCODE_ADDR as usize * 4, 1),
             (RLC_GPM_UCODE_ADDR as usize * 4, 0x11E),
             (RLC_CNTL as usize * 4, RLC_CNTL_RLC_ENABLE),
         ]

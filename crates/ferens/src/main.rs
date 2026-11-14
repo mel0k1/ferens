@@ -15,7 +15,7 @@ use ferens_gfx8::regs;
 use ferens_kfd::{Allocator, ComputeQueue, Device, GPU_PAGE_BYTES};
 use ferens_mmio::CpQueue;
 
-const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt";
+const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens status";
 
 const RING_BYTES: usize = 4096;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -30,6 +30,7 @@ fn main() {
         Some("dispatch-mmio") => run_dispatch_mmio(),
         Some("gate") => run_gate(args.get(1).map(String::as_str)),
         Some("dispatch-gtt") => run_dispatch_gtt(),
+        Some("status") => run_status(),
         _ => eprintln!("{USAGE}"),
     }
 }
@@ -136,6 +137,31 @@ fn run_dispatch_gtt() {
     }
 }
 
+fn run_status() {
+    if let Err(error) = status_live() {
+        eprintln!("status failed: {error}");
+    }
+}
+
+fn status_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let regs_info = device
+        .regs_bar()
+        .ok_or_else(|| io::Error::other("no register bar"))?;
+    let mapped = MappedBar::from_sysfs(&slot_dir, regs_info.index)?;
+    let mmio = Mmio::new(mapped);
+    println!("{}", ferens_mmio::snapshot(&mmio).report());
+    Ok(())
+}
+
 fn gate_live(with_pg: bool) -> io::Result<()> {
     let device = ferens_mmio::find_polaris()?;
     println!(
@@ -211,9 +237,10 @@ fn dispatch_gtt_live() -> io::Result<()> {
         fence = buffer.host.read_u32(FENCE_OFFSET);
     }
     if fence != FENCE_MAGIC {
+        let report = queue.status_report();
         queue.destroy()?;
         return Err(io::Error::other(format!(
-            "fence timeout after {}ms, rptr report {} dwords",
+            "fence timeout after {}ms, rptr report {} dwords\n{report}",
             started.elapsed().as_millis(),
             queue.read_pointer_dw()
         )));

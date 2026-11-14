@@ -24,6 +24,40 @@ const REG_LIST_SIZE_OFFSET: usize = 0x50;
 const REG_LIST_ARRAY_OFFSET: usize = 0x54;
 const RLC_LIST_HEADER_MIN_BYTES: usize = 0x58;
 
+const CRC32_POLY: u32 = 0xedb8_8320;
+
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 != 0 {
+                (value >> 1) ^ CRC32_POLY
+            } else {
+                value >> 1
+            };
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+    }
+    table
+}
+
+static CRC32_TABLE: [u32; 256] = crc32_table();
+
+pub fn crc32(words: &[u32]) -> u32 {
+    let mut crc = 0xffff_ffff;
+    for word in words {
+        for byte in word.to_le_bytes() {
+            crc = CRC32_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize] ^ (crc >> 8);
+        }
+    }
+    !crc
+}
+
 pub struct UcodeFirmware {
     pub version: u32,
     pub feature_version: u32,

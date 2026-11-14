@@ -13,9 +13,13 @@ use ferens_gfx8::regs;
 use ferens_gfx8::ring::write_packet;
 
 use crate::csb;
+use crate::fault;
 use crate::fw::{self, FirmwareSet};
+use crate::golden;
 use crate::gtt::HostBuffer;
+use crate::hdp;
 use crate::hqd;
+use crate::iommu;
 use crate::power;
 use crate::rlc;
 use crate::vm;
@@ -112,6 +116,11 @@ impl CpQueue {
                 "device bound to {driver}, unbind it before direct cp access"
             )));
         }
+        let slot = slot_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        iommu::guard(Path::new("/"), &slot)?;
         let device = PciDevice::from_sysfs(slot_dir)?;
         let regs_info = device
             .regs_bar()
@@ -148,6 +157,7 @@ impl CpQueue {
     }
 
     fn bring_up(&mut self, firmware: FirmwareSet, chip: Chip) -> io::Result<()> {
+        golden::apply(&self.regs, chip)?;
         let built;
         let pg = match chip {
             Chip::Polaris11 | Chip::Polaris12 => {
@@ -170,6 +180,7 @@ impl CpQueue {
                     }
                     words[first..last].copy_from_slice(&built);
                 }
+                self.verify_aperture(CSB_OFFSET, &built, "clear state buffer")?;
                 Some(power::PgSetup {
                     csb: &built,
                     csb_va: CSB_OFFSET,
@@ -189,9 +200,9 @@ impl CpQueue {
             hqd::CP_MEC_ME1_UCODE_ADDR,
             hqd::CP_MEC_ME1_UCODE_DATA,
             &firmware.mec1,
-        );
+        )?;
         if let Some(mec2) = &firmware.mec2 {
-            self.load_mec(hqd::CP_MEC_ME2_UCODE_ADDR, hqd::CP_MEC_ME2_UCODE_DATA, mec2);
+            self.load_mec(hqd::CP_MEC_ME2_UCODE_ADDR, hqd::CP_MEC_ME2_UCODE_DATA, mec2)?;
         }
         self.regs.write_reg_direct(hqd::CP_MEC_CNTL, 0);
         thread::sleep(CP_SETTLE);
@@ -219,12 +230,47 @@ impl CpQueue {
         Ok(())
     }
 
-    fn load_mec(&mut self, addr_reg: u32, data_reg: u32, firmware: &fw::UcodeFirmware) {
+    fn load_mec(
+        &mut self,
+        addr_reg: u32,
+        data_reg: u32,
+        firmware: &fw::UcodeFirmware,
+    ) -> io::Result<()> {
         self.regs.write_reg_direct(addr_reg, 0);
         for word in &firmware.words {
             self.regs.write_reg_direct(data_reg, *word);
         }
         self.regs.write_reg_direct(addr_reg, firmware.version);
+        let mut readback = Vec::with_capacity(firmware.words.len());
+        for index in 0..firmware.words.len() {
+            self.regs.write_reg_direct(addr_reg, index as u32);
+            readback.push(self.regs.read_reg_direct(data_reg));
+        }
+        let expected = fw::crc32(&firmware.words);
+        let actual = fw::crc32(&readback);
+        if actual != expected {
+            return Err(io::Error::other(format!(
+                "mec ucode readback crc mismatch: want {expected:#010x}, got {actual:#010x}"
+            )));
+        }
+        self.regs.write_reg_direct(addr_reg, firmware.version);
+        Ok(())
+    }
+
+    fn verify_aperture(&mut self, vram_offset: u64, words: &[u32], what: &str) -> io::Result<()> {
+        let first = ((vram_offset - VRAM_BASE) as usize) / 4;
+        let mut readback = Vec::with_capacity(words.len());
+        for index in 0..words.len() {
+            readback.push(self.aperture.read_u32((first + index) * 4));
+        }
+        let expected = fw::crc32(words);
+        let actual = fw::crc32(&readback);
+        if actual != expected {
+            return Err(io::Error::other(format!(
+                "{what} readback crc mismatch: want {expected:#010x}, got {actual:#010x}"
+            )));
+        }
+        Ok(())
     }
 
     fn setup_vm(&mut self) -> io::Result<()> {
@@ -249,7 +295,7 @@ impl CpQueue {
         )?;
         vm::program_l1_l2(&self.regs);
         vm::program_context0(&self.regs, &config);
-        vm::invalidate(&self.regs, hqd::VMID_0);
+        hdp::invalidate_with_flush(&self.regs, hqd::VMID_0);
         Ok(())
     }
 
@@ -417,7 +463,7 @@ impl CpQueue {
             host.pfns(),
         )?;
         self.gtt_cursor += pages as u32;
-        vm::invalidate(&self.regs, hqd::VMID_0);
+        hdp::invalidate_with_flush(&self.regs, hqd::VMID_0);
         Ok(GttBuffer {
             host,
             va: first_page_index as u64 * vm::GPU_PAGE_BYTES,
@@ -432,6 +478,7 @@ impl CpQueue {
             io::Error::new(io::ErrorKind::InvalidInput, "packet does not fit the ring")
         })?;
         self.wp = next;
+        hdp::flush(&self.regs);
         self.regs
             .bar()
             .write_u32(self.doorbell_index as usize * 4, self.wp as u32);
@@ -473,13 +520,18 @@ impl CpQueue {
             }
             if started.elapsed() > timeout {
                 return Err(io::Error::other(format!(
-                    "fence timeout after {}ms, rptr report {} dwords",
+                    "fence timeout after {}ms, rptr report {} dwords\n{}",
                     started.elapsed().as_millis(),
-                    self.read_pointer_dw()
+                    self.read_pointer_dw(),
+                    self.status_report()
                 )));
             }
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    pub fn status_report(&self) -> String {
+        fault::snapshot(&self.regs).report()
     }
 
     pub fn destroy(&mut self) -> io::Result<()> {
