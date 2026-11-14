@@ -14,6 +14,7 @@ pub mod power;
 pub mod queue;
 pub mod rlc;
 pub mod sdma;
+pub mod smu;
 pub mod vm;
 
 pub use fault::{snapshot, Status};
@@ -49,6 +50,7 @@ pub use sdma::{
     copy_packet, fence_packet, fence_packet_with_irq, trap_packet, Sdma, SdmaStatus,
     COPY_COUNT_MAX, FENCE_TIMEOUT,
 };
+pub use smu::{mhz, DpmTables, SmuController};
 pub use vm::{
     context_regs, fill_identity_table, program_context, program_context0, program_l1_l2,
     pte_identity_word, pte_system_word, ContextRegs, VmConfig, GPU_PAGE_BYTES, PTE_FLAGS,

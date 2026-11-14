@@ -728,7 +728,7 @@ impl CpDevice {
             .read_u32((slot_meta_va(slot) - VRAM_BASE) as usize + offset)
     }
 
-    pub fn wait_fence(&self, slot: usize, timeout: Duration) -> io::Result<u32> {
+    pub fn wait_fence(&mut self, slot: usize, timeout: Duration) -> io::Result<u32> {
         let started = Instant::now();
         loop {
             let fence = self.meta_u32(slot, FENCE_OFFSET);
@@ -736,26 +736,63 @@ impl CpDevice {
                 return Ok(fence);
             }
             if started.elapsed() > timeout {
-                return Err(io::Error::other(format!(
-                    "fence timeout after {}ms, rptr report {} dwords\n{}",
-                    started.elapsed().as_millis(),
-                    self.read_pointer_dw(slot),
-                    self.hang_report(slot)
-                )));
+                return Err(self.fence_timeout_error(slot, started.elapsed()));
             }
             thread::sleep(Duration::from_millis(1));
         }
     }
 
     pub fn wait_fence_with_irq(
-        &self,
+        &mut self,
         slot: usize,
         irq: &dyn IrqWait,
         timeout: Duration,
     ) -> io::Result<u32> {
-        let mut get_fence = || self.meta_u32(slot, FENCE_OFFSET);
-        wait_fence_irq(&mut get_fence, irq, timeout)
-            .map_err(|error| io::Error::other(format!("{error}\n{}", self.hang_report(slot))))
+        let outcome = {
+            let mut get_fence = || self.meta_u32(slot, FENCE_OFFSET);
+            wait_fence_irq(&mut get_fence, irq, timeout)
+        };
+        outcome
+            .map_err(|error| io::Error::other(format!("{error}\n{}", self.hang_reset_report(slot))))
+    }
+
+    // Таймаут фенса: попытка автоматического dequeue-сброса
+    // (gfx_v8_0_deactivate_hqd(adev, 2)) и hang-отчёт.
+    fn hang_reset_report(&mut self, slot: usize) -> String {
+        let hang = self.hang_report(slot);
+        let reset = match self.reset_slot(slot) {
+            Ok(()) => "auto dequeue reset: ok (слот закрыт, для работы нужен повторный open_queue)"
+                .to_string(),
+            Err(error) => format!("auto dequeue reset failed: {error}"),
+        };
+        format!("{reset}\n{hang}")
+    }
+
+    fn fence_timeout_error(&mut self, slot: usize, waited: Duration) -> io::Error {
+        let hang_reset = self.hang_reset_report(slot);
+        io::Error::other(format!(
+            "fence timeout after {}ms\n{hang_reset}",
+            waited.as_millis()
+        ))
+    }
+
+    // Сброс зависшего слота: та же последовательность, что в deactivate_hqd,
+    // но по запросу снаружи; после успеха слот выписывается из списка
+    // открытых, как после destroy, и его можно открыть заново.
+    pub fn reset_slot(&mut self, slot: usize) -> io::Result<()> {
+        let state = self
+            .queues
+            .iter()
+            .find(|queue| queue.slot == slot)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "slot is not open"))?;
+        let (me, pipe, queue, vmid) = (state.me, state.pipe, state.queue, state.vmid);
+        self.acquire_queue(me, pipe, queue, vmid);
+        let result = self.deactivate_hqd();
+        self.release_queue();
+        if result.is_ok() {
+            self.queues.retain(|state| state.slot != slot);
+        }
+        result
     }
 
     pub fn hang_report(&self, slot: usize) -> String {

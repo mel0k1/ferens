@@ -30,6 +30,8 @@
 
 ## tier 3 — живучесть
 
+- [x] dequeue-сброс зависшего слота — reset_slot повторяет gfx_v8_0_deactivate_hqd(adev, 2): DEQUEUE_REQUEST = 2 под SRBM-мультиплексором, опрос CP_HQD_ACTIVE 200 мс, обнуление DEQUEUE_REQUEST/PQ_RPTR/PQ_WPTR; оба wait-пути по таймауту фенса автоматически пробуют сброс и включают результат в hang-отчёт, `ferens reset` показывает сброс и повторный диспетч на восстановленном слоте; SRBM/GRBM soft reset всей карты остаётся
+- [x] SMU: управление частотами — SMC-канал сообщений с handshake из smu7_smumgr.c (SMC_RESP_0/SMC_MESSAGE_0/SMC_MSG_ARG_0), проверка smu7_is_smc_ram_running, PPSMC_MSG_API_GetSclk/MclkFrequency в единицах 10 кГц, DPM-таблица из SMC SRAM через заголовок прошивки (SMU7_FIRMWARE_HEADER_LOCATION + офсеты из smu73.h/smu73_discrete.h, выверены компиляцией), форс максимума/минимума через SCLKDPM/MCLKDPM_SetEnabledMask и unforce через PCIeDPM_UnForceLevel с полными масками, `ferens clocks` без отвязки драйвера; записи DPM-таблиц, VddC и thermal остаются за чертой
 - [ ] GPU reset: SRBM/GRBM soft reset, восстановление golden regs, полный ресетап очередей
 - [ ] реакция на VM fault: стоп очереди, decode, recovery
 - [ ] suspend/resume

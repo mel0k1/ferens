@@ -17,9 +17,9 @@ use ferens_gfx8::pm4::PacketBuilder;
 use ferens_gfx8::regs;
 use ferens_kfd::{Allocator, ComputeQueue, Device, GPU_PAGE_BYTES};
 use ferens_mmio::ih;
-use ferens_mmio::{CpDevice, GfxRing, IvEntry, QueuePriority, Sdma};
+use ferens_mmio::{CpDevice, GfxRing, IvEntry, QueuePriority, Sdma, SmuController};
 
-const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens queues | ferens gfx-ring | ferens ih | ferens msi | ferens queues-irq | ferens status | ferens sdma-copy [bytes]";
+const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens queues | ferens gfx-ring | ferens ih | ferens msi | ferens queues-irq | ferens clocks | ferens reset | ferens status | ferens sdma-copy [bytes]";
 
 const RING_BYTES: usize = 4096;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,7 +43,21 @@ fn main() {
         Some("ih") => run_ih(),
         Some("msi") => run_msi(),
         Some("queues-irq") => run_queues_irq(),
+        Some("clocks") => run_clocks(),
+        Some("reset") => run_reset(),
         _ => eprintln!("{USAGE}"),
+    }
+}
+
+fn run_clocks() {
+    if let Err(error) = clocks_live() {
+        eprintln!("clocks failed: {error}");
+    }
+}
+
+fn run_reset() {
+    if let Err(error) = reset_live() {
+        eprintln!("reset failed: {error}");
     }
 }
 
@@ -448,6 +462,112 @@ fn queues_irq_live() -> io::Result<()> {
         unbind_uio(&device.slot)?;
         println!("teardown: ih выключен, uio отвязан");
     }
+    if let Some(driver) = &freed_driver {
+        println!(
+            "вернуть карту: echo {} > /sys/bus/pci/drivers/{driver}/bind",
+            device.slot
+        );
+    }
+    Ok(())
+}
+
+fn clocks_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let regs_info = device
+        .regs_bar()
+        .ok_or_else(|| io::Error::other("no register bar"))?;
+    let mapped = MappedBar::from_sysfs(&slot_dir, regs_info.index)?;
+    let mmio = Mmio::new(mapped);
+    let smu = SmuController::new(&mmio)?;
+    println!("SMC ram running, SMC_IND окно через 0x80/0x81, канал SMC_MESSAGE_0/SMC_RESP_0");
+    let tables = smu.dpm_tables()?;
+    println!("{}", tables.report());
+    let sclk = smu.current_sclk()?;
+    let mclk = smu.current_mclk()?;
+    println!(
+        "текущие sclk {} MHz, mclk {} MHz (PPSMC_MSG_API_GetSclk/MclkFrequency)",
+        ferens_mmio::mhz(sclk),
+        ferens_mmio::mhz(mclk)
+    );
+    smu.force_sclk_highest(&tables)?;
+    smu.force_mclk_highest(&tables)?;
+    thread::sleep(Duration::from_millis(300));
+    let sclk = smu.current_sclk()?;
+    let mclk = smu.current_mclk()?;
+    println!(
+        "форс максимум: sclk {} MHz, mclk {} MHz",
+        ferens_mmio::mhz(sclk),
+        ferens_mmio::mhz(mclk)
+    );
+    smu.force_sclk_lowest()?;
+    smu.force_mclk_lowest()?;
+    thread::sleep(Duration::from_millis(300));
+    let sclk = smu.current_sclk()?;
+    let mclk = smu.current_mclk()?;
+    println!(
+        "форс минимум: sclk {} MHz, mclk {} MHz",
+        ferens_mmio::mhz(sclk),
+        ferens_mmio::mhz(mclk)
+    );
+    smu.unforce(&tables)?;
+    thread::sleep(Duration::from_millis(300));
+    let sclk = smu.current_sclk()?;
+    let mclk = smu.current_mclk()?;
+    println!(
+        "после unforce (PCIeDPM_UnForceLevel + полные маски): sclk {} MHz, mclk {} MHz",
+        ferens_mmio::mhz(sclk),
+        ferens_mmio::mhz(mclk)
+    );
+    Ok(())
+}
+
+fn reset_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let freed_driver = unbind_current(&slot_dir, &device.slot)?;
+    if let Some(driver) = &freed_driver {
+        println!("unbound {driver}");
+    }
+    let mut cp = CpDevice::create(&slot_dir, device.chip)?;
+    cp.open_queue(0, 0, QueuePriority::normal())?;
+    cp.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = cp.dispatch_stream(0, [1, 1, 1], [64, 1, 1]);
+    cp.submit(0, &stream)?;
+    let fence = cp.wait_fence(0, FENCE_TIMEOUT)?;
+    println!(
+        "slot 0: фенс {fence:#x}, output {:#010x} — очередь жива",
+        cp.meta_u32(0, OUTPUT_OFFSET)
+    );
+    println!("hang-отчёт перед сбросом:\n{}", cp.hang_report(0));
+    println!("сброс слота 0: CP_HQD_DEQUEUE_REQUEST=2, как gfx_v8_0_deactivate_hqd(adev, 2)");
+    cp.reset_slot(0)?;
+    println!("hang-отчёт после сброса:\n{}", cp.hang_report(0));
+    println!("восстановление: повторный open_queue, load_kernel, диспетч");
+    cp.open_queue(0, 0, QueuePriority::normal())?;
+    cp.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = cp.dispatch_stream(0, [1, 1, 1], [64, 1, 1]);
+    cp.submit(0, &stream)?;
+    let fence = cp.wait_fence(0, FENCE_TIMEOUT)?;
+    println!(
+        "слот восстановлен: фенс {fence:#x}, output {:#010x}",
+        cp.meta_u32(0, OUTPUT_OFFSET)
+    );
+    cp.destroy()?;
     if let Some(driver) = &freed_driver {
         println!(
             "вернуть карту: echo {} > /sys/bus/pci/drivers/{driver}/bind",
