@@ -30,8 +30,9 @@ pub use gtt::{pagemap_offset, parse_pagemap_entry, HostBuffer};
 pub use hqd::{
     doorbell_control, persistent_state, pq_base_hi_word, pq_base_word, pq_control, quantum,
     srbm_gfx_cntl, CPC_INT_STATUS, CP_HQD_ACTIVE, CP_HQD_PQ_BASE, CP_HQD_PQ_CONTROL,
-    CP_ME1_PIPE0_INT_CNTL, CP_MEC_CNTL, CP_MEC_ME1_UCODE_ADDR, CP_MEC_ME1_UCODE_DATA,
-    DOORBELL_INDEX, DOORBELL_MEC_RING0, DOORBELL_MEC_RING7, SRBM_GFX_CNTL,
+    CP_ME1_PIPE0_INT_CNTL, CP_MEC_CNTL, CP_MEC_CNTL_ME1_HALT, CP_MEC_CNTL_ME2_HALT,
+    CP_MEC_ME1_UCODE_ADDR, CP_MEC_ME1_UCODE_DATA, DOORBELL_INDEX, DOORBELL_MEC_RING0,
+    DOORBELL_MEC_RING7, SRBM_GFX_CNTL,
 };
 pub use ih::{IvEntry, SRC_ID_COMPUTE_EOP, SRC_ID_SDMA0_TRAP};
 pub use power::{

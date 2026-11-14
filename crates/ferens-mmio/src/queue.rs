@@ -577,6 +577,23 @@ impl CpDevice {
         );
     }
 
+    // доступ для диагностики полного сброса: mux-селектор, канарки HQD/MEC
+    pub fn select_engine(&mut self, me: u32, pipe: u32, queue: u32, vmid: u32) {
+        self.acquire_queue(me, pipe, queue, vmid);
+    }
+
+    pub fn read_hqd_active(&self) -> u32 {
+        self.regs.read_reg_direct(hqd::CP_HQD_ACTIVE)
+    }
+
+    pub fn write_mec_cntl(&self, value: u32) {
+        self.regs.write_reg_direct(hqd::CP_MEC_CNTL, value);
+    }
+
+    pub fn read_mec_cntl(&self) -> u32 {
+        self.regs.read_reg_direct(hqd::CP_MEC_CNTL)
+    }
+
     fn release_queue(&mut self) {
         self.regs.write_reg_direct(hqd::SRBM_GFX_CNTL, 0);
     }

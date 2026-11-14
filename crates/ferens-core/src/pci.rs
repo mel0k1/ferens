@@ -151,6 +151,112 @@ pub fn scan_dir(dir: &Path) -> io::Result<Vec<PciDevice>> {
     Ok(devices)
 }
 
+// Детекция методов полного сброса по config space — порядок повторяет
+// pci_reset_fn_methods[] из drivers/pci/pci.c: flr → af_flr → pm → bus.
+// device_specific (quirk-таблица) и acpi (_RST) из config space не видны.
+pub const PCI_CAP_POINTER: usize = 0x34;
+pub const PCI_STATUS_CAP_LIST: u16 = 0x10;
+pub const PCI_CAP_ID_PM: u8 = 0x01;
+pub const PCI_CAP_ID_EXP: u8 = 0x10;
+pub const PCI_CAP_ID_AF: u8 = 0x13;
+pub const PCI_PM_CTRL_STATE_MASK: u16 = 0x0003;
+pub const PCI_PM_CTRL_NO_SOFT_RESET: u16 = 0x0008;
+pub const PCI_EXP_DEVCAP_FLR: u32 = 0x1000_0000;
+pub const PCI_AF_CAP_TP: u8 = 0x01;
+pub const PCI_AF_CAP_FLR: u8 = 0x02;
+// страховка от зацикленной цепочки capability-указателей
+const CAP_WALK_HOPS: usize = 48;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetCaps {
+    pub flr: bool,
+    pub af_flr: bool,
+    // Some(true) — PM-кап есть и NO_SOFT_RESET чист, сброс через D3hot→D0
+    // возможен; Some(false) — NO_SOFT_RESET стоит; None — PM-капа нет
+    pub pm: Option<bool>,
+}
+
+impl ResetCaps {
+    pub fn method_report(self) -> String {
+        let mut parts = Vec::new();
+        if self.flr {
+            parts.push("flr (DEVCAP, DEVCTL BCR_FLR, задержка 100 мс)");
+        }
+        if self.af_flr {
+            parts.push("af_flr (AF cap, AF_CTRL FLR)");
+        }
+        match self.pm {
+            Some(true) => parts.push("pm (D3hot→D0 через PMCSR)"),
+            Some(false) => parts.push("pm недоступен (PMCSR NO_SOFT_RESET)"),
+            None => parts.push("pm недоступен (нет PM-капы)"),
+        }
+        parts.push("bus (шиный сброс родительского порта)");
+        parts.join("; ")
+    }
+}
+
+// Обход capability-списка: бит Cap List в статусе, указатель в 0x34,
+// каждый элемент — (id в байте 0, next в байте 1), смещения маскируются на 0xfc.
+pub fn cap_offsets(config: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let status = match config.get(1..3) {
+        Some(bytes) => u16::from_le_bytes([bytes[0], bytes[1]]),
+        None => return offsets,
+    };
+    if status & PCI_STATUS_CAP_LIST == 0 {
+        return offsets;
+    }
+    let Some(mut ptr) = config.get(PCI_CAP_POINTER).copied() else {
+        return offsets;
+    };
+    for _ in 0..CAP_WALK_HOPS {
+        if ptr == 0 {
+            break;
+        }
+        let pos = ptr as usize & 0xfc;
+        let Some(&next) = config.get(pos + 1) else {
+            break;
+        };
+        offsets.push(pos);
+        ptr = next;
+    }
+    offsets
+}
+
+pub fn detect_reset_caps(config: &[u8]) -> ResetCaps {
+    let mut caps = ResetCaps {
+        flr: false,
+        af_flr: false,
+        pm: None,
+    };
+    for pos in cap_offsets(config) {
+        match config.get(pos) {
+            Some(&PCI_CAP_ID_PM) => {
+                if let Some(bytes) = config.get(pos + 2..pos + 4) {
+                    // PCI_PM_CTRL = cap + 2
+                    let csr = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    caps.pm = Some(csr & PCI_PM_CTRL_NO_SOFT_RESET == 0);
+                }
+            }
+            Some(&PCI_CAP_ID_EXP) => {
+                if let Some(bytes) = config.get(pos + 4..pos + 8) {
+                    // PCI_EXP_DEVCAP = cap + 4
+                    let devcap = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    caps.flr = devcap & PCI_EXP_DEVCAP_FLR != 0;
+                }
+            }
+            Some(&PCI_CAP_ID_AF) => {
+                if let Some(&af_cap) = config.get(pos + 3) {
+                    // PCI_AF_CAP = cap + 3: транзакции завершены и FLR заявлен
+                    caps.af_flr = af_cap & PCI_AF_CAP_TP != 0 && af_cap & PCI_AF_CAP_FLR != 0;
+                }
+            }
+            _ => {}
+        }
+    }
+    caps
+}
+
 pub fn scan_sysfs() -> io::Result<Vec<PciDevice>> {
     scan_dir(Path::new(SYSFS_PCI_DEVICES))
 }
@@ -158,6 +264,89 @@ pub fn scan_sysfs() -> io::Result<Vec<PciDevice>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with_caps() -> Vec<u8> {
+        let mut config = vec![0u8; 256];
+        config[0..2].copy_from_slice(&0x1002u16.to_le_bytes());
+        config[2..4].copy_from_slice(&0x67c0u16.to_le_bytes());
+        config[1] |= PCI_STATUS_CAP_LIST as u8;
+        config[PCI_CAP_POINTER] = 0x50;
+        // PM-капа на 0x50: PMCSR в D0, NO_SOFT_RESET чист
+        config[0x50] = PCI_CAP_ID_PM;
+        config[0x51] = 0x60;
+        config[0x52] = 0x00;
+        config[0x53] = 0x00;
+        // PCIe-капа на 0x60 с DEVCAP.FLR
+        config[0x60] = PCI_CAP_ID_EXP;
+        config[0x61] = 0x70;
+        config[0x64..0x68].copy_from_slice(&PCI_EXP_DEVCAP_FLR.to_le_bytes());
+        // AF-капа на 0x70 с TP и FLR
+        config[0x70] = PCI_CAP_ID_AF;
+        config[0x71] = 0x00;
+        config[0x73] = PCI_AF_CAP_TP | PCI_AF_CAP_FLR;
+        config
+    }
+
+    #[test]
+    fn cap_walk_finds_chained_caps() {
+        let config = config_with_caps();
+        assert_eq!(cap_offsets(&config), vec![0x50, 0x60, 0x70]);
+    }
+
+    #[test]
+    fn detect_caps_reads_all_three_methods() {
+        let caps = detect_reset_caps(&config_with_caps());
+        assert!(caps.flr);
+        assert!(caps.af_flr);
+        assert_eq!(caps.pm, Some(true));
+        let report = caps.method_report();
+        assert!(report.contains("flr (DEVCAP"));
+        assert!(report.contains("af_flr (AF cap"));
+        assert!(report.contains("pm (D3hot→D0"));
+        assert!(report.ends_with("bus (шиный сброс родительского порта)"));
+    }
+
+    #[test]
+    fn no_soft_reset_disables_pm_reset() {
+        let mut config = config_with_caps();
+        config[0x52] = PCI_PM_CTRL_NO_SOFT_RESET as u8;
+        let caps = detect_reset_caps(&config);
+        assert_eq!(caps.pm, Some(false));
+        assert!(caps.method_report().contains("NO_SOFT_RESET"));
+    }
+
+    #[test]
+    fn af_cap_without_features_disables_af_flr() {
+        let mut config = config_with_caps();
+        config[0x73] = 0;
+        assert!(!detect_reset_caps(&config).af_flr);
+        config[0x73] = PCI_AF_CAP_TP;
+        assert!(!detect_reset_caps(&config).af_flr);
+        config[0x73] = PCI_AF_CAP_FLR;
+        assert!(!detect_reset_caps(&config).af_flr);
+    }
+
+    #[test]
+    fn missing_cap_list_bit_yields_no_caps() {
+        let mut config = config_with_caps();
+        config[1] &= !PCI_STATUS_CAP_LIST as u8;
+        assert!(cap_offsets(&config).is_empty());
+        assert_eq!(
+            detect_reset_caps(&config),
+            ResetCaps {
+                flr: false,
+                af_flr: false,
+                pm: None
+            }
+        );
+    }
+
+    #[test]
+    fn looped_cap_chain_is_bounded() {
+        let mut config = config_with_caps();
+        config[0x51] = 0x50; // next указывает на себя
+        assert_eq!(cap_offsets(&config).len(), CAP_WALK_HOPS);
+    }
 
     const SAMPLE_RESOURCE: &str = "0x00000000f7b00000 0x00000000f7bfffff 0x0000000000040200\n0x00000000c0000000 0x00000000cfffffff 0x0000000000040200\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x000000000000e000 0x000000000000e0ff 0x0000000000040101\n";
 

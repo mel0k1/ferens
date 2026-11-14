@@ -19,7 +19,7 @@ use ferens_kfd::{Allocator, ComputeQueue, Device, GPU_PAGE_BYTES};
 use ferens_mmio::ih;
 use ferens_mmio::{CpDevice, GfxRing, IvEntry, QueuePriority, Sdma, SmuController};
 
-const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens queues | ferens gfx-ring | ferens ih | ferens msi | ferens queues-irq | ferens clocks | ferens reset | ferens fault | ferens soft-reset | ferens suspend | ferens resume | ferens status | ferens sdma-copy [bytes]";
+const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens queues | ferens gfx-ring | ferens ih | ferens msi | ferens queues-irq | ferens clocks | ferens reset | ferens fault | ferens soft-reset | ferens full-reset | ferens suspend | ferens resume | ferens status | ferens sdma-copy [bytes]";
 
 const RING_BYTES: usize = 4096;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,6 +47,7 @@ fn main() {
         Some("reset") => run_reset(),
         Some("fault") => run_fault(),
         Some("soft-reset") => run_soft_reset(),
+        Some("full-reset") => run_full_reset(),
         Some("suspend") => run_suspend(),
         Some("resume") => run_resume(),
         _ => eprintln!("{USAGE}"),
@@ -74,6 +75,12 @@ fn run_fault() {
 fn run_soft_reset() {
     if let Err(error) = soft_reset_live() {
         eprintln!("soft-reset failed: {error}");
+    }
+}
+
+fn run_full_reset() {
+    if let Err(error) = full_reset_live() {
+        eprintln!("full-reset failed: {error}");
     }
 }
 
@@ -686,6 +693,110 @@ fn soft_reset_live() -> io::Result<()> {
     let fence = cp.wait_fence(0, FENCE_TIMEOUT)?;
     println!(
         "после soft reset: фенс {fence:#x}, output {:#010x} — карта пересобрана и жива",
+        cp.meta_u32(0, OUTPUT_OFFSET)
+    );
+    cp.destroy()?;
+    if let Some(driver) = &freed_driver {
+        println!(
+            "вернуть карту: echo {} > /sys/bus/pci/drivers/{driver}/bind",
+            device.slot
+        );
+    }
+    Ok(())
+}
+
+fn full_reset_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let freed_driver = unbind_current(&slot_dir, &device.slot)?;
+    if let Some(driver) = &freed_driver {
+        println!("unbound {driver}");
+    }
+    // карта жива: полный bring-up, очередь открыта, кернел отработал
+    let mut cp = CpDevice::create(&slot_dir, device.chip)?;
+    cp.open_queue(0, 0, QueuePriority::normal())?;
+    cp.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = cp.dispatch_stream(0, [1, 1, 1], [64, 1, 1]);
+    cp.submit(0, &stream)?;
+    let fence = cp.wait_fence(0, FENCE_TIMEOUT)?;
+    println!(
+        "до сброса: фенс {fence:#x}, output {:#010x} — очередь активна",
+        cp.meta_u32(0, OUTPUT_OFFSET)
+    );
+
+    // детекция метода: sysfs reset_method заполняет само ядро (>= 5.15),
+    // без него — обход capability-списка config space
+    let config = ferens_mmio::save_pci_config(&slot_dir)?;
+    let methods = match std::fs::read_to_string(slot_dir.join("reset_method")) {
+        Ok(text) if !text.trim().is_empty() => {
+            format!("по sysfs reset_method: {}", text.trim())
+        }
+        _ => format!(
+            "по config space: {}",
+            ferens_core::detect_reset_caps(&config).method_report()
+        ),
+    };
+    println!("методы сброса {methods}");
+
+    // канарки: активный HQD слота 0 и MEC-халт в CP_MEC_CNTL — после полного
+    // сброса оба обязаны уйти в ноль. Очередь остаётся активной на время
+    // сброса: HQD должен замереть вместе с картой.
+    cp.select_engine(1, 0, 0, 0);
+    let hqd_active_before = cp.read_hqd_active();
+    let canary = ferens_mmio::CP_MEC_CNTL_ME1_HALT | ferens_mmio::CP_MEC_CNTL_ME2_HALT;
+    cp.write_mec_cntl(canary);
+    let mec_before = cp.read_mec_cntl();
+    let status_before = ferens_mmio::snapshot(cp.regs());
+    if hqd_active_before == 0 || mec_before != canary {
+        return Err(io::Error::other(format!(
+            "канарка не встала: CP_HQD_ACTIVE {hqd_active_before:#x}, CP_MEC_CNTL {mec_before:#x}"
+        )));
+    }
+    println!(
+        "канарки до сброса: CP_HQD_ACTIVE {hqd_active_before:#x}, CP_MEC_CNTL {mec_before:#x}"
+    );
+    drop(cp);
+
+    // pci_reset_function: save + disable + [device_specific/acpi/flr/af_flr/pm/bus] + restore
+    std::fs::write(slot_dir.join("reset"), "1")?;
+    println!("записали 1 в sysfs reset — ядро сделало save/restore config и сброс");
+
+    let mapped = MappedBar::from_sysfs(&slot_dir, device.regs_bar().unwrap().index)?;
+    let mmio = Mmio::new(mapped);
+    let mec_after = mmio.read_reg_direct(ferens_mmio::CP_MEC_CNTL);
+    mmio.write_reg_direct(
+        ferens_mmio::SRBM_GFX_CNTL,
+        ferens_mmio::srbm_gfx_cntl(1, 0, 0, 0),
+    );
+    let hqd_active_after = mmio.read_reg_direct(ferens_mmio::CP_HQD_ACTIVE);
+    let status_after = ferens_mmio::snapshot(&mmio);
+    if mec_after == canary || hqd_active_after != 0 {
+        return Err(io::Error::other(format!(
+            "полный сброс не сработал: CP_MEC_CNTL {mec_after:#x}, CP_HQD_ACTIVE {hqd_active_after:#x}"
+        )));
+    }
+    println!(
+        "после сброса: CP_MEC_CNTL {mec_after:#x} (канарка очищена), CP_HQD_ACTIVE {hqd_active_after:#x} (HQD мёртв)"
+    );
+    println!("GRBM/SRBM до:  {}", status_before.report());
+    println!("GRBM/SRBM после: {}", status_after.report());
+
+    // полный bring-up с нуля — микрокод, golden, VM, очереди
+    let mut cp = CpDevice::create(&slot_dir, device.chip)?;
+    cp.open_queue(0, 0, QueuePriority::normal())?;
+    cp.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = cp.dispatch_stream(0, [1, 1, 1], [64, 1, 1]);
+    cp.submit(0, &stream)?;
+    let fence = cp.wait_fence(0, FENCE_TIMEOUT)?;
+    println!(
+        "после full reset: фенс {fence:#x}, output {:#010x} — карта пересобрана и жива",
         cp.meta_u32(0, OUTPUT_OFFSET)
     );
     cp.destroy()?;
