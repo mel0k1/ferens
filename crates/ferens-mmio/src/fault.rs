@@ -39,6 +39,42 @@ pub struct FaultInfo {
     pub mcclient: u32,
 }
 
+impl FaultInfo {
+    // gmc_v8_0_vm_decode_fault: "VM fault (0x.., vmid N, pasid N) at page N,
+    // write from 'XXXX' (0x..) (N)" — блок-клиент кодируется ASCII-символами
+    // MCCLIENT сверху вниз.
+    pub fn report(&self) -> String {
+        let bytes = [
+            (self.mcclient >> 24) as u8,
+            (self.mcclient >> 16) as u8,
+            (self.mcclient >> 8) as u8,
+            self.mcclient as u8,
+        ];
+        let block: String = bytes
+            .iter()
+            .map(|&byte| {
+                if byte.is_ascii_graphic() {
+                    byte as char
+                } else {
+                    '?'
+                }
+            })
+            .collect();
+        format!(
+            "VM fault (protections {:#04x}, vmid {}, ctx {}) at page {}, {} from '{}' (mcclient {:#010x}, client id {}) — fault_addr {:#x}",
+            self.protections,
+            self.vmid,
+            self.context,
+            self.page,
+            if self.write { "write" } else { "read" },
+            block,
+            self.mcclient,
+            self.memory_client_id,
+            (self.page as u64) << 12
+        )
+    }
+}
+
 pub struct Status {
     pub grbm: u32,
     pub srbm: u32,

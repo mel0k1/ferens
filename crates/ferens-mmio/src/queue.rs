@@ -16,12 +16,14 @@ use ferens_gfx8::ring::write_packet;
 use crate::csb;
 use crate::fault;
 use crate::fw::{self, FirmwareSet};
+use crate::gfx;
 use crate::golden;
 use crate::gtt::HostBuffer;
 use crate::hdp;
 use crate::hqd;
 use crate::iommu;
 use crate::power;
+use crate::reset;
 use crate::rlc;
 use crate::vm;
 
@@ -66,6 +68,12 @@ pub const WPTR_POLL_OFFSET: usize = 4;
 pub const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const ACTIVE_TIMEOUT: Duration = Duration::from_millis(200);
 pub const CP_SETTLE: Duration = Duration::from_micros(50);
+// VA вне identity-окна (VRAM_BASE..VRAM_BASE+VM_WINDOW_BYTES) и GTT-окна:
+// PTE пустой, обращение рождает VM fault. VRAM_BASE = 0x04000000, окно 16 МБ,
+// GTT с 0x05000000 — берём нулевую страницу, она заведомо неспапнута.
+pub const FAULT_TARGET_VA: u64 = 0;
+// Опрос VM_CONTEXT0_PROTECTION_FAULT_STATUS после фалящего диспетча.
+pub const FAULT_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct GttBuffer {
     pub host: HostBuffer,
@@ -112,6 +120,7 @@ pub struct QueueState {
 pub struct CpDevice {
     regs: Mmio<MappedBar>,
     aperture: MappedBar,
+    chip: Chip,
     pub mec_fw_version: u32,
     pub rlc_fw_version: u32,
     pub mec2_loaded: bool,
@@ -304,6 +313,7 @@ impl CpDevice {
         let mut device = Self {
             regs,
             aperture,
+            chip,
             mec_fw_version: firmware.mec1.version,
             rlc_fw_version: firmware.rlc.version,
             mec2_loaded: firmware.mec2.is_some(),
@@ -615,6 +625,56 @@ impl CpDevice {
         device_packets(&plan)
     }
 
+    // Диспетч, чей вывод идёт на FAULT_TARGET_VA — страницу вне identity- и
+    // GTT-окон: волна умирает по TLB-промаху, CP лочит VM fault в статусах GMC.
+    // Дескриптор по-прежнему кладётся в meta-область слота, фейлится только вывод.
+    pub fn dispatch_fault_stream(
+        &mut self,
+        slot: usize,
+        grid: [u32; 3],
+        group: [u32; 3],
+    ) -> Vec<u32> {
+        let payload_va = slot_meta_va(slot);
+        let mut plan = dispatch_plan_for(grid, group, payload_va);
+        plan.output_va = FAULT_TARGET_VA;
+        let descriptor = isa::buffer_descriptor(FAULT_TARGET_VA, 0, 4);
+        {
+            let aperture = self.aperture.words_mut();
+            let first = ((payload_va - VRAM_BASE) / 4) as usize + KERNARG_OFFSET / 4;
+            aperture[first..first + 4].copy_from_slice(&descriptor);
+        }
+        device_packets(&plan)
+    }
+
+    // Опрос VM_CONTEXT0_PROTECTION_FAULT_STATUS: бит VALID лочится на фолте
+    // независимо от включения прерываний.
+    pub fn wait_fault(&self, timeout: Duration) -> io::Result<fault::FaultInfo> {
+        let started = Instant::now();
+        loop {
+            if let Some(fault) = fault::read_fault(&self.regs, 0) {
+                return Ok(fault);
+            }
+            if started.elapsed() > timeout {
+                return Err(io::Error::other(format!(
+                    "vm fault did not arrive in {}ms (dispatch to {FAULT_TARGET_VA:#x})",
+                    timeout.as_millis()
+                )));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub fn fault_report(&self) -> String {
+        match fault::read_fault(&self.regs, 0) {
+            Some(info) => info.report(),
+            None => "vm fault: нет зачёта в VM_CONTEXT0_PROTECTION_FAULT_STATUS".to_string(),
+        }
+    }
+
+    pub fn clear_fault(&self) {
+        fault::clear_fault(&self.regs, 0);
+    }
+
     pub fn dispatch_stream_irq(
         &mut self,
         slot: usize,
@@ -793,6 +853,55 @@ impl CpDevice {
             self.queues.retain(|state| state.slot != slot);
         }
         result
+    }
+
+    // План soft reset без исполнения — busy-маски в текущем состоянии карты.
+    pub fn soft_reset_plan(&self) -> String {
+        reset::plan_soft_reset(&self.regs).report()
+    }
+
+    // Полный soft reset карты: маски собираются по busy-битам
+    // (gfx_v8_0_check_soft_reset + gmc_v8_0_check_soft_reset + SDMA), pre_soft_reset
+    // глушит RLC/GFX/MEC и деактивирует открытые HQD, apply_soft_reset дёргает
+    // GRBM/SRBM_SOFT_RESET, пост — полный ресетап как в bring_up (золотые
+    // регистры, RLC/PG, MEC-микрокод, VM-таблицы). Открытые слоты и GTT-буферы
+    // после сброса не выживают — их надо открывать и аллоцировать заново.
+    pub fn soft_reset(&mut self) -> io::Result<String> {
+        let plan = reset::plan_soft_reset(&self.regs);
+        if plan.is_empty() {
+            return Ok("карта простаивает (busy-биты чисты), сброс не потребовался".to_string());
+        }
+        // gfx_v8_0_pre_soft_reset
+        rlc::stop(&self.regs);
+        self.regs.write_reg_direct(
+            gfx::CP_ME_CNTL,
+            gfx::CP_ME_CNTL_ME_HALT | gfx::CP_ME_CNTL_PFP_HALT | gfx::CP_ME_CNTL_CE_HALT,
+        );
+        let slots: Vec<(u32, u32, u32, u32)> = self
+            .queues
+            .iter()
+            .map(|queue| (queue.me, queue.pipe, queue.queue, queue.vmid))
+            .collect();
+        for (me, pipe, queue, vmid) in slots {
+            self.acquire_queue(me, pipe, queue, vmid);
+            // в pre_soft_reset результат deactivate не проверяется — HQD уйдёт
+            // вместе с мягким сбросом CP
+            let _ = self.deactivate_hqd();
+            self.release_queue();
+        }
+        self.regs.write_reg_direct(
+            hqd::CP_MEC_CNTL,
+            hqd::CP_MEC_CNTL_ME1_HALT | hqd::CP_MEC_CNTL_ME2_HALT,
+        );
+        power::cg_off(&self.regs);
+        // gfx_v8_0_soft_reset
+        reset::apply_soft_reset(&self.regs, plan)?;
+        // пост-ресетап: golden, RLC/PG, MEC, VM — как при create
+        self.queues.clear();
+        self.gtt_cursor = 0;
+        let firmware = fw::load(self.chip)?;
+        self.bring_up(firmware, self.chip)?;
+        Ok(plan.report())
     }
 
     pub fn hang_report(&self, slot: usize) -> String {

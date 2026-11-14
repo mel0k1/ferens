@@ -12,9 +12,11 @@ pub mod ih;
 pub mod iommu;
 pub mod power;
 pub mod queue;
+pub mod reset;
 pub mod rlc;
 pub mod sdma;
 pub mod smu;
+pub mod suspend;
 pub mod vm;
 
 pub use fault::{snapshot, Status};
@@ -39,11 +41,11 @@ pub use power::{
 };
 pub use queue::{
     dispatch_plan_for, dispatch_stream_va, find_polaris, slot_engine, slot_meta_va, slot_ring_va,
-    CpDevice, QueuePriority, QueueState, CSB_OFFSET, DEFAULT_PAGE_OFFSET, GFX_LAYOUT_END,
-    GFX_META_OFFSET, GFX_RING_BYTES, GFX_RING_OFFSET, GTT_BASE_VA, GTT_WINDOW_BYTES, IH_LAYOUT_END,
-    IH_RING_BYTES, IH_RING_OFFSET, IH_WB_OFFSET, KERNEL_OFFSET, LAYOUT_END, PTE1_TABLE_OFFSET,
-    PTE_TABLE_OFFSET, QUEUE_SLOTS, RING_BYTES, RING_OFFSET, RING_STRIDE, SLOT_META_OFFSET,
-    SLOT_META_STRIDE, VM_WINDOW_BYTES, VRAM_BASE,
+    CpDevice, QueuePriority, QueueState, CSB_OFFSET, DEFAULT_PAGE_OFFSET, FAULT_POLL_TIMEOUT,
+    FAULT_TARGET_VA, GFX_LAYOUT_END, GFX_META_OFFSET, GFX_RING_BYTES, GFX_RING_OFFSET, GTT_BASE_VA,
+    GTT_WINDOW_BYTES, IH_LAYOUT_END, IH_RING_BYTES, IH_RING_OFFSET, IH_WB_OFFSET, KERNEL_OFFSET,
+    LAYOUT_END, PTE1_TABLE_OFFSET, PTE_TABLE_OFFSET, QUEUE_SLOTS, RING_BYTES, RING_OFFSET,
+    RING_STRIDE, SLOT_META_OFFSET, SLOT_META_STRIDE, VM_WINDOW_BYTES, VRAM_BASE,
 };
 pub use rlc::{RLC_CGCG_CGLS_CTRL, RLC_CGCG_CGLS_CTRL_3D, RLC_CNTL, RLC_PG_CNTL};
 pub use sdma::{
@@ -51,6 +53,9 @@ pub use sdma::{
     COPY_COUNT_MAX, FENCE_TIMEOUT,
 };
 pub use smu::{mhz, DpmTables, SmuController};
+pub use suspend::{
+    config_matches, config_path, halt_blocks, restore_pci_config, save_pci_config, PCI_CONFIG_BYTES,
+};
 pub use vm::{
     context_regs, fill_identity_table, program_context, program_context0, program_l1_l2,
     pte_identity_word, pte_system_word, ContextRegs, VmConfig, GPU_PAGE_BYTES, PTE_FLAGS,

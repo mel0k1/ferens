@@ -19,7 +19,7 @@ use ferens_kfd::{Allocator, ComputeQueue, Device, GPU_PAGE_BYTES};
 use ferens_mmio::ih;
 use ferens_mmio::{CpDevice, GfxRing, IvEntry, QueuePriority, Sdma, SmuController};
 
-const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens queues | ferens gfx-ring | ferens ih | ferens msi | ferens queues-irq | ferens clocks | ferens reset | ferens status | ferens sdma-copy [bytes]";
+const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt | ferens queues | ferens gfx-ring | ferens ih | ferens msi | ferens queues-irq | ferens clocks | ferens reset | ferens fault | ferens soft-reset | ferens suspend | ferens resume | ferens status | ferens sdma-copy [bytes]";
 
 const RING_BYTES: usize = 4096;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,6 +45,10 @@ fn main() {
         Some("queues-irq") => run_queues_irq(),
         Some("clocks") => run_clocks(),
         Some("reset") => run_reset(),
+        Some("fault") => run_fault(),
+        Some("soft-reset") => run_soft_reset(),
+        Some("suspend") => run_suspend(),
+        Some("resume") => run_resume(),
         _ => eprintln!("{USAGE}"),
     }
 }
@@ -58,6 +62,30 @@ fn run_clocks() {
 fn run_reset() {
     if let Err(error) = reset_live() {
         eprintln!("reset failed: {error}");
+    }
+}
+
+fn run_fault() {
+    if let Err(error) = fault_live() {
+        eprintln!("fault failed: {error}");
+    }
+}
+
+fn run_soft_reset() {
+    if let Err(error) = soft_reset_live() {
+        eprintln!("soft-reset failed: {error}");
+    }
+}
+
+fn run_suspend() {
+    if let Err(error) = suspend_live() {
+        eprintln!("suspend failed: {error}");
+    }
+}
+
+fn run_resume() {
+    if let Err(error) = resume_live() {
+        eprintln!("resume failed: {error}");
     }
 }
 
@@ -574,6 +602,186 @@ fn reset_live() -> io::Result<()> {
             device.slot
         );
     }
+    Ok(())
+}
+
+fn fault_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let freed_driver = unbind_current(&slot_dir, &device.slot)?;
+    if let Some(driver) = &freed_driver {
+        println!("unbound {driver}");
+    }
+    let mut cp = CpDevice::create(&slot_dir, device.chip)?;
+    cp.open_queue(0, 0, QueuePriority::normal())?;
+    cp.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = cp.dispatch_fault_stream(0, [1, 1, 1], [64, 1, 1]);
+    cp.submit(0, &stream)?;
+    println!(
+        "диспетч с выводом на VA {:#x} — страница вне identity- и GTT-окон",
+        ferens_mmio::FAULT_TARGET_VA
+    );
+    let fault = cp.wait_fault(ferens_mmio::FAULT_POLL_TIMEOUT)?;
+    println!("{}", fault.report());
+    println!("hang-отчёт:\n{}", cp.hang_report(0));
+    cp.clear_fault();
+    println!("фолт сброшен через VM_CONTEXT0_CNTL2");
+    cp.reset_slot(0)?;
+    println!("слот 0 сброшен (dequeue), очередь открывается заново");
+    cp.open_queue(0, 0, QueuePriority::normal())?;
+    cp.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = cp.dispatch_stream(0, [1, 1, 1], [64, 1, 1]);
+    cp.submit(0, &stream)?;
+    let fence = cp.wait_fence(0, FENCE_TIMEOUT)?;
+    println!(
+        "после восстановления: фенс {fence:#x}, output {:#010x} — VM fault пережит и вылечен",
+        cp.meta_u32(0, OUTPUT_OFFSET)
+    );
+    cp.destroy()?;
+    if let Some(driver) = &freed_driver {
+        println!(
+            "вернуть карту: echo {} > /sys/bus/pci/drivers/{driver}/bind",
+            device.slot
+        );
+    }
+    Ok(())
+}
+
+fn soft_reset_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let freed_driver = unbind_current(&slot_dir, &device.slot)?;
+    if let Some(driver) = &freed_driver {
+        println!("unbound {driver}");
+    }
+    let mut cp = CpDevice::create(&slot_dir, device.chip)?;
+    cp.open_queue(0, 0, QueuePriority::normal())?;
+    cp.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = cp.dispatch_stream(0, [1, 1, 1], [64, 1, 1]);
+    cp.submit(0, &stream)?;
+    let fence = cp.wait_fence(0, FENCE_TIMEOUT)?;
+    println!("до сброса: фенс {fence:#x}, очередь жива");
+    println!("план сброса по busy-битам: {}", cp.soft_reset_plan());
+    let report = cp.soft_reset()?;
+    println!("soft reset выполнен: {report}");
+    println!("восстановление: open_queue, load_kernel, диспетч на пересетапленной карте");
+    cp.open_queue(0, 0, QueuePriority::normal())?;
+    cp.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = cp.dispatch_stream(0, [1, 1, 1], [64, 1, 1]);
+    cp.submit(0, &stream)?;
+    let fence = cp.wait_fence(0, FENCE_TIMEOUT)?;
+    println!(
+        "после soft reset: фенс {fence:#x}, output {:#010x} — карта пересобрана и жива",
+        cp.meta_u32(0, OUTPUT_OFFSET)
+    );
+    cp.destroy()?;
+    if let Some(driver) = &freed_driver {
+        println!(
+            "вернуть карту: echo {} > /sys/bus/pci/drivers/{driver}/bind",
+            device.slot
+        );
+    }
+    Ok(())
+}
+
+fn suspend_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let freed_driver = unbind_current(&slot_dir, &device.slot)?;
+    if let Some(driver) = &freed_driver {
+        println!("unbound {driver}");
+    }
+    let regs_info = device
+        .regs_bar()
+        .ok_or_else(|| io::Error::other("no register bar"))?;
+    let mapped = MappedBar::from_sysfs(&slot_dir, regs_info.index)?;
+    let mmio = Mmio::new(mapped);
+    // порядок amdgpu: движки глушатся до pci_save_state
+    ferens_mmio::halt_blocks(&mmio);
+    let config = ferens_mmio::save_pci_config(&slot_dir)?;
+    let path = ferens_mmio::config_path(&device.slot);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &config)?;
+    println!(
+        "карта остановлена: IH/SDMA/GFX/MEC заглушены, RLC выключен, CG снят; PCI config {} байт в {}",
+        config.len(),
+        path.display()
+    );
+    println!(
+        "вернуть карту после resume: echo {} > /sys/bus/pci/drivers/{driver}/bind",
+        device.slot,
+        driver = freed_driver.as_deref().unwrap_or("amdgpu")
+    );
+    Ok(())
+}
+
+fn resume_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let path = ferens_mmio::config_path(&device.slot);
+    let saved = std::fs::read(&path).map_err(|error| {
+        io::Error::other(format!(
+            "нет снапшота {} ({error}) — сначала ferens suspend",
+            path.display()
+        ))
+    })?;
+    if !ferens_mmio::config_matches(&saved, device.vendor_id, device.device_id) {
+        return Err(io::Error::other(
+            "снапшот PCI config от другой карты или старого образа — удалите файл и сделайте suspend заново",
+        ));
+    }
+    let freed_driver = unbind_current(&slot_dir, &device.slot)?;
+    if let Some(driver) = &freed_driver {
+        println!("unbound {driver}");
+    }
+    ferens_mmio::restore_pci_config(&slot_dir, &saved)?;
+    println!("PCI config восстановлен: BARs, командный регистр последним");
+    let mut cp = CpDevice::create(&slot_dir, device.chip)?;
+    cp.open_queue(0, 0, QueuePriority::normal())?;
+    cp.load_kernel(&isa::KERNEL_WORDS)?;
+    let stream = cp.dispatch_stream(0, [1, 1, 1], [64, 1, 1]);
+    cp.submit(0, &stream)?;
+    let fence = cp.wait_fence(0, FENCE_TIMEOUT)?;
+    println!(
+        "карта проснулась: фенс {fence:#x}, output {:#010x}",
+        cp.meta_u32(0, OUTPUT_OFFSET)
+    );
+    cp.destroy()?;
+    let driver = freed_driver.as_deref().unwrap_or("amdgpu");
+    println!(
+        "вернуть карту: echo {} > /sys/bus/pci/drivers/{driver}/bind",
+        device.slot
+    );
     Ok(())
 }
 

@@ -30,11 +30,12 @@
 
 ## tier 3 — живучесть
 
-- [x] dequeue-сброс зависшего слота — reset_slot повторяет gfx_v8_0_deactivate_hqd(adev, 2): DEQUEUE_REQUEST = 2 под SRBM-мультиплексором, опрос CP_HQD_ACTIVE 200 мс, обнуление DEQUEUE_REQUEST/PQ_RPTR/PQ_WPTR; оба wait-пути по таймауту фенса автоматически пробуют сброс и включают результат в hang-отчёт, `ferens reset` показывает сброс и повторный диспетч на восстановленном слоте; SRBM/GRBM soft reset всей карты остаётся
+- [x] dequeue-сброс зависшего слота — reset_slot повторяет gfx_v8_0_deactivate_hqd(adev, 2): DEQUEUE_REQUEST = 2 под SRBM-мультиплексором, опрос CP_HQD_ACTIVE 200 мс, обнуление DEQUEUE_REQUEST/PQ_RPTR/PQ_WPTR; оба wait-пути по таймауту фенса автоматически пробуют сброс и включают результат в hang-отчёт, `ferens reset` показывает сброс и повторный диспетч на восстановленном слоте
 - [x] SMU: управление частотами — SMC-канал сообщений с handshake из smu7_smumgr.c (SMC_RESP_0/SMC_MESSAGE_0/SMC_MSG_ARG_0), проверка smu7_is_smc_ram_running, PPSMC_MSG_API_GetSclk/MclkFrequency в единицах 10 кГц, DPM-таблица из SMC SRAM через заголовок прошивки (SMU7_FIRMWARE_HEADER_LOCATION + офсеты из smu73.h/smu73_discrete.h, выверены компиляцией), форс максимума/минимума через SCLKDPM/MCLKDPM_SetEnabledMask и unforce через PCIeDPM_UnForceLevel с полными масками, `ferens clocks` без отвязки драйвера; записи DPM-таблиц, VddC и thermal остаются за чертой
-- [ ] GPU reset: SRBM/GRBM soft reset, восстановление golden regs, полный ресетап очередей
-- [ ] реакция на VM fault: стоп очереди, decode, recovery
-- [ ] suspend/resume
+- [x] GPU soft reset — маски GRBM/SRBM_SOFT_RESET собираются по busy-битам (gfx_v8_0_check_soft_reset + gmc_v8_0_check_soft_reset + busy SDMA из SRBM_STATUS2; в ядре SDMA-биты безусловные, ferens ставит только при busy), pre-фаза gfx_v8_0_pre_soft_reset (rlc stop, CP_ME_CNTL halt, deactivate открытых HQD, MEC halt, cg_off), сброс через GMCON_DEBUG GFX_STALL/GFX_CLEAR и установку/снятие битов с паузами 50 мкс, пост — полный bring_up (golden, RLC/PG, MEC, VM) и тестовый диспетч, `ferens soft-reset`
+- [x] реакция на VM fault — диспетч на VA 0 (пустая PTE вне identity- и GTT-окон), волна умирает, CP лочит VM_CONTEXT0_PROTECTION_FAULT_STATUS без прерываний, декод как gmc_v8_0_vm_decode_fault (protections/vmid/страница/RW/ASCII-блок из MCCLIENT), очистка через VM_CONTEXT0_CNTL2, dequeue-сброс слота и корректный диспетч — полный цикл детект/декод/recovery, `ferens fault`; interrupt-путь для VM fault (src_id 223) не делается, фолт ловится поллингом
+- [x] suspend/resume — suspend глушит IH/SDMA0/1/GFX/MEC/RLC и CG в порядке amdgpu и сохраняет 256 байт PCI config space в /var/lib/ferens/<slot>.bin (pci_save_state), resume сверяет vendor/device снапшота, восстанавливает config (dwords 15..=4, командный регистр последним — как pci_restore_state) и делает полный bring-up с тестовым диспетчем, `ferens suspend` / `ferens resume`; PCIe D3 не трогается — power state остаётся за ядром
+- [ ] полный GPU reset через FLR/reset-вызов (D3cold/функциональный level reset из sysfs reset)
 
 ## tier 4 — интерфейс
 
