@@ -11,6 +11,7 @@ use crate::gtt::HostBuffer;
 use crate::hdp;
 use crate::hqd;
 use crate::iommu;
+use crate::queue;
 use crate::queue::{
     program_vm0, taken_by_driver, GttBuffer, GTT_BASE_VA, GTT_WINDOW_BYTES, PTE_TABLE_OFFSET,
     SDMA_INSTANCE_STRIDE, SDMA_LAYOUT_END, SDMA_META_INSTANCE_STRIDE, SDMA_META_OFFSET,
@@ -458,6 +459,20 @@ impl Sdma {
             }
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    pub fn wait_fence_with_irq(
+        &self,
+        instance: usize,
+        irq: &dyn ferens_core::IrqWait,
+        timeout: Duration,
+    ) -> io::Result<u32> {
+        let fence_offset = (meta_va(instance) - VRAM_BASE) as usize;
+        let mut get_fence = || self.aperture.read_u32(fence_offset);
+        queue::wait_fence_irq(&mut get_fence, irq, timeout).map_err(|error| {
+            let status = engine_status(&self.regs, instance);
+            io::Error::other(format!("sdma{instance} {error}\n{}", status.report()))
+        })
     }
 
     pub fn status(&self, instance: usize) -> SdmaStatus {

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ferens_core::{scan_sysfs, BarOps, Chip, MappedBar, Mmio, PciDevice};
+use ferens_core::{scan_sysfs, BarOps, Chip, IrqWait, MappedBar, Mmio, PciDevice};
 use ferens_gfx8::dispatch::{
     self, DispatchPlan, FENCE_MAGIC, FENCE_OFFSET, KERNARG_OFFSET, OUTPUT_OFFSET,
 };
@@ -250,6 +250,29 @@ pub fn fence_irq_packet(fence_va: u64) -> Vec<u32> {
         &[hqd::COMPUTE_EOP_TRIGGER],
     );
     builder.into_words()
+}
+
+pub fn wait_fence_irq(
+    get_fence: &mut dyn FnMut() -> u32,
+    irq: &dyn ferens_core::IrqWait,
+    timeout: Duration,
+) -> io::Result<u32> {
+    let started = Instant::now();
+    loop {
+        let fence = get_fence();
+        if fence == FENCE_MAGIC {
+            return Ok(fence);
+        }
+        let remaining = timeout.checked_sub(started.elapsed()).unwrap_or_default();
+        if remaining.is_zero() {
+            return Err(io::Error::other(format!(
+                "fence timeout after {}ms",
+                started.elapsed().as_millis()
+            )));
+        }
+        irq.wait_interrupt(remaining)?;
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 impl CpDevice {
@@ -717,11 +740,45 @@ impl CpDevice {
                     "fence timeout after {}ms, rptr report {} dwords\n{}",
                     started.elapsed().as_millis(),
                     self.read_pointer_dw(slot),
-                    self.status_report()
+                    self.hang_report(slot)
                 )));
             }
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    pub fn wait_fence_with_irq(
+        &self,
+        slot: usize,
+        irq: &dyn IrqWait,
+        timeout: Duration,
+    ) -> io::Result<u32> {
+        let mut get_fence = || self.meta_u32(slot, FENCE_OFFSET);
+        wait_fence_irq(&mut get_fence, irq, timeout)
+            .map_err(|error| io::Error::other(format!("{error}\n{}", self.hang_report(slot))))
+    }
+
+    pub fn hang_report(&self, slot: usize) -> String {
+        let (me, pipe, queue, doorbell) = slot_engine(slot);
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "slot {slot} me{me} pipe{pipe} queue{queue} doorbell {doorbell:#x}: rptr {} dwords, wptr {} dwords",
+            self.read_pointer_dw(slot),
+            self.write_pointer_dw(slot)
+        ));
+        let prev = self.regs.read_reg_direct(hqd::SRBM_GFX_CNTL);
+        self.regs.write_reg_direct(
+            hqd::SRBM_GFX_CNTL,
+            hqd::srbm_gfx_cntl(me, pipe, queue, slot as u32),
+        );
+        let active = self.regs.read_reg_direct(hqd::CP_HQD_ACTIVE);
+        let dequeue = self.regs.read_reg_direct(hqd::CP_HQD_DEQUEUE_REQUEST);
+        self.regs.write_reg_direct(hqd::SRBM_GFX_CNTL, prev);
+        lines.push(format!(
+            "hqd active {active:#x}, dequeue request {dequeue:#x}"
+        ));
+        lines.push(self.status_report());
+        lines.join("\n")
     }
 
     pub fn status_report(&self) -> String {
@@ -801,6 +858,48 @@ mod tests {
         assert_eq!(IH_RING_OFFSET, 0x0403_D000);
         assert_eq!(IH_WB_OFFSET, 0x0403_E000);
         assert_eq!(IH_LAYOUT_END, 0x0403_F000);
+    }
+
+    struct ArmedIrq {
+        waits: std::cell::Cell<usize>,
+    }
+
+    impl ferens_core::IrqWait for ArmedIrq {
+        fn wait_interrupt(&self, _timeout: Duration) -> io::Result<()> {
+            self.waits.set(self.waits.get() + 1);
+            thread::sleep(Duration::from_millis(1));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn wait_fence_irq_returns_when_fence_lands_after_interrupt() {
+        let irq = ArmedIrq {
+            waits: std::cell::Cell::new(0),
+        };
+        let mut reads = 0;
+        let mut get_fence = || {
+            reads += 1;
+            if reads >= 2 {
+                FENCE_MAGIC
+            } else {
+                0
+            }
+        };
+        let fence = wait_fence_irq(&mut get_fence, &irq, Duration::from_secs(1)).unwrap();
+        assert_eq!(fence, FENCE_MAGIC);
+        assert_eq!(irq.waits.get(), 1);
+    }
+
+    #[test]
+    fn wait_fence_irq_reports_timeout_without_firing() {
+        let irq = ArmedIrq {
+            waits: std::cell::Cell::new(0),
+        };
+        let mut get_fence = || 0u32;
+        let error = wait_fence_irq(&mut get_fence, &irq, Duration::from_millis(40)).unwrap_err();
+        assert!(error.to_string().contains("fence timeout"));
+        assert!(irq.waits.get() > 0);
     }
 
     #[test]

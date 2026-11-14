@@ -86,12 +86,21 @@ pub fn unbind_uio(slot: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub fn set_command_flags(slot_dir: &Path) -> io::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandMode {
+    Intx,
+    Msi,
+}
+
+pub fn set_command_flags(slot_dir: &Path, mode: CommandMode) -> io::Result<()> {
     let mut config = File::open(slot_dir.join("config"))?;
     let mut header = [0u8; 6];
     config.read_exact(&mut header)?;
     let command = u16::from_le_bytes([header[4], header[5]]);
-    let updated = (command | COMMAND_MEMORY | COMMAND_MASTER) & !COMMAND_INTX_DISABLE;
+    let updated = match mode {
+        CommandMode::Intx => (command | COMMAND_MEMORY | COMMAND_MASTER) & !COMMAND_INTX_DISABLE,
+        CommandMode::Msi => command | COMMAND_MEMORY | COMMAND_MASTER | COMMAND_INTX_DISABLE,
+    };
     if updated == command {
         return Ok(());
     }
@@ -197,15 +206,24 @@ fn read_hex(path: &Path) -> io::Result<u64> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+impl crate::irq::IrqWait for UioDevice {
+    fn wait_interrupt(&self, timeout: Duration) -> io::Result<()> {
+        UioDevice::wait_interrupt(self, timeout)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn command_flags_set_master_and_keep_intx_enabled() {
+    fn command_flags_match_intx_and_msi_modes() {
         let command = COMMAND_MEMORY | COMMAND_INTX_DISABLE;
-        let updated = (command | COMMAND_MEMORY | COMMAND_MASTER) & !COMMAND_INTX_DISABLE;
-        assert_eq!(updated, COMMAND_MEMORY | COMMAND_MASTER);
-        assert_eq!(updated & COMMAND_INTX_DISABLE, 0);
+        let intx = (command | COMMAND_MEMORY | COMMAND_MASTER) & !COMMAND_INTX_DISABLE;
+        assert_eq!(intx, COMMAND_MEMORY | COMMAND_MASTER);
+        assert_eq!(intx & COMMAND_INTX_DISABLE, 0);
+        let msi = command | COMMAND_MEMORY | COMMAND_MASTER | COMMAND_INTX_DISABLE;
+        assert_eq!(msi, COMMAND_MEMORY | COMMAND_MASTER | COMMAND_INTX_DISABLE);
+        assert_eq!(msi & COMMAND_INTX_DISABLE, COMMAND_INTX_DISABLE);
     }
 }

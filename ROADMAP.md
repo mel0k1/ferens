@@ -21,11 +21,12 @@
 - [x] SDMA ucode и кольцо — микрокод обоих инстансов с CRC-верификацией, GFX-кольца 2x4 КБ в VRAM, writeback rptr, кик через MMIO WPTR, LINEAR_COPY и FENCE пакеты, GTT→VRAM→GTT в `ferens sdma-copy`
 - [x] несколько очередей и VMID, приоритеты — до 8 слотов через CP_HQD (ME1 pipe0-3 и ME2 с mec2.bin), doorbell MEC_RING0+slot, CP_HQD_PIPE/QUEUE_PRIORITY + CP_HQD_QUANTUM, VMID1 со своей таблицей VM_CONTEXT1, GTT-аллокации в обе таблицы, `ferens queues` пускает слот 0 (VMID0, normal) и слот 1 (VMID1, high) разом
 
-## tier 2 — события
+## tier 2 — события (готово)
 
 - [x] CP_INT и IH ring через uio — tonga_ih-последовательность (RB_SIZE log2(байт/4), WPTR writeback, overflow-танец, IV 16 байт, rptr в байтах), SDMA trap (src 224) и compute EOP через запись 0x20000000 в CPC_INT_STATUS (src 178), `ferens ih` гоняет оба пути через uio_pci_generic и poll на /dev/uioN
-- [ ] fence по прерыванию вместо поллинга — IV-приход разобран в `ferens ih`, осталось встроить в wait-путь очередей
-- [ ] детект зависания CP по таймаутам
+- [x] свой kernel-модуль для MSI — kernel/ferens_irq: PCI-драйвер Polaris-идов, один MSI-вектор, waitqueue-мост на /dev/ferens_irq0 с ioctl WAIT/COUNT/INFO/RESET, вся настройка IH в userspace; RPTR_REARM только под MSI, как в ядре; `ferens msi` гоняет SDMA trap + compute EOP под MSI
+- [x] fence по прерыванию вместо поллинга — trait IrqWait (FerensMod ioctl / UioDevice poll), wait_fence_irq с перепроверкой фенса после каждого прерывания, `ferens queues-irq` ждёт фенсы обоих слотов по прерыванию с откатом на uio
+- [x] детект зависания CP по таймаутам — hang_report по таймауту в обоих wait-путях: rptr/wptr слота, CP_HQD_ACTIVE и CP_HQD_DEQUEUE_REQUEST через SRBM_GFX_CNTL-мультиплексор, GRBM/SRBM-статусы и VM-фолты; автоматический dequeue-сброс не сделан
 
 ## tier 3 — живучесть
 
@@ -41,7 +42,7 @@
 
 ## про C-код amdgpu
 
-Golden-таблицы, init-последовательности, форматы ucode — это списки MMIO-записей, портируем их дословно, Rust тут ничего не выигрывает. Собственный kernel-модуль понадобится на tier 2, когда придут MSI и IH; до этого userspace через sysfs хватает.
+Golden-таблицы, init-последовательности, форматы ucode — это списки MMIO-записей, портируем их дословно, Rust тут ничего не выигрывает. Собственный kernel-модуль ferens_irq на tier 2 стал мостом прерываний (один MSI-вектор и waitqueue); вся остальная работа с устройством остаётся в userspace через sysfs и BAR-mmap.
 
 ## известные пропуски
 

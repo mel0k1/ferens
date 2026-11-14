@@ -75,7 +75,14 @@ pub fn ptr_mask(ring_bytes: u32) -> u32 {
     ring_bytes - 1
 }
 
-pub fn setup<B: BarOps>(regs: &Mmio<B>, ring_va: u64, wb_va: u64, dummy_va: u64, ring_bytes: u32) {
+pub fn setup<B: BarOps>(
+    regs: &Mmio<B>,
+    ring_va: u64,
+    wb_va: u64,
+    dummy_va: u64,
+    ring_bytes: u32,
+    rearm: bool,
+) {
     regs.write_reg_direct(INTERRUPT_CNTL2, (dummy_va >> 8) as u32);
     let cntl = regs.read_reg_direct(INTERRUPT_CNTL);
     regs.write_reg_direct(
@@ -83,7 +90,10 @@ pub fn setup<B: BarOps>(regs: &Mmio<B>, ring_va: u64, wb_va: u64, dummy_va: u64,
         cntl & !(IH_DUMMY_RD_OVERRIDE | IH_REQ_NONSNOOP_EN),
     );
     regs.write_reg_direct(IH_RB_BASE, (ring_va >> 8) as u32);
-    let rb_cntl = WPTR_OVERFLOW_CLEAR | rb_size_field(ring_bytes) | WPTR_WRITEBACK_ENABLE;
+    let mut rb_cntl = WPTR_OVERFLOW_CLEAR | rb_size_field(ring_bytes) | WPTR_WRITEBACK_ENABLE;
+    if rearm {
+        rb_cntl |= RPTR_REARM;
+    }
     regs.write_reg_direct(IH_RB_CNTL, rb_cntl);
     regs.write_reg_direct(IH_RB_WPTR_ADDR_LO, wb_va as u32);
     regs.write_reg_direct(IH_RB_WPTR_ADDR_HI, ((wb_va >> 32) as u32) & 0xFF);
@@ -236,7 +246,7 @@ mod tests {
         mmio.bar().cells.borrow_mut()[INTERRUPT_CNTL as usize] =
             IH_DUMMY_RD_OVERRIDE | IH_REQ_NONSNOOP_EN;
         mmio.bar().cells.borrow_mut()[IH_DOORBELL_RPTR as usize] = DOORBELL_RPTR_ENABLE;
-        setup(&mmio, 0x0403_D000, 0x0403_E000, 0x0402_C000, 4096);
+        setup(&mmio, 0x0403_D000, 0x0403_E000, 0x0402_C000, 4096, false);
         let cells = mmio.bar().cells.borrow();
         assert_eq!(cells[INTERRUPT_CNTL2 as usize], 0x0402_C000 >> 8);
         assert_eq!(
@@ -253,6 +263,16 @@ mod tests {
         assert_eq!(cells[IH_RB_RPTR as usize], 0);
         assert_eq!(cells[IH_RB_WPTR as usize], 0);
         assert_eq!(cells[IH_DOORBELL_RPTR as usize] & DOORBELL_RPTR_ENABLE, 0);
+    }
+
+    #[test]
+    fn setup_rearm_sets_rptr_rearm_bit_for_msi() {
+        let mmio = Mmio::new(FakeBar::new());
+        setup(&mmio, 0x0403_D000, 0x0403_E000, 0x0402_C000, 4096, true);
+        assert_eq!(
+            mmio.bar().cells.borrow()[IH_RB_CNTL as usize],
+            WPTR_OVERFLOW_CLEAR | rb_size_field(4096) | WPTR_WRITEBACK_ENABLE | RPTR_REARM
+        );
     }
 
     #[test]
