@@ -1,9 +1,11 @@
+use std::io;
 use std::thread;
 use std::time::Duration;
 
 use ferens_core::{BarOps, Mmio};
 
 use crate::fw::UcodeFirmware;
+use crate::power::{self, PgSetup};
 
 pub const RLC_CNTL: u32 = 0xEC00;
 pub const RLC_PG_CNTL: u32 = 0xEC43;
@@ -92,7 +94,11 @@ pub fn enable<B: BarOps>(regs: &Mmio<B>) {
     thread::sleep(SETTLE);
 }
 
-pub fn resume<B: BarOps>(regs: &Mmio<B>, firmware: &UcodeFirmware) {
+pub fn resume<B: BarOps>(
+    regs: &Mmio<B>,
+    firmware: &UcodeFirmware,
+    pg: Option<&PgSetup>,
+) -> io::Result<()> {
     stop(regs);
     let cg = regs.read_reg_direct(RLC_CGCG_CGLS_CTRL);
     regs.write_reg_direct(RLC_CGCG_CGLS_CTRL, cg & !CGCG_CGLS_EN);
@@ -100,8 +106,12 @@ pub fn resume<B: BarOps>(regs: &Mmio<B>, firmware: &UcodeFirmware) {
     regs.write_reg_direct(RLC_CGCG_CGLS_CTRL_3D, cg3d & !CGCG_CGLS_EN);
     regs.write_reg_direct(RLC_PG_CNTL, 0);
     reset(regs);
+    if let Some(setup) = pg {
+        power::init_pg(regs, setup)?;
+    }
     load_ucode(regs, firmware);
     enable(regs);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -227,7 +237,7 @@ mod tests {
             feature_version: 1,
             words: vec![0xBEEF_0001, 0xBEEF_0002],
         };
-        resume(&mmio, &firmware);
+        resume(&mmio, &firmware, None).unwrap();
         let ggi = GRBM_GFX_INDEX as usize * 4;
         let expected: Vec<(usize, u32)> = [
             (RLC_CNTL as usize * 4, 0),
@@ -286,6 +296,49 @@ mod tests {
                 GRBM_GFX_INDEX as usize * 4,
                 GRBM_GFX_INDEX_INSTANCE_BROADCAST
             ))
+        );
+    }
+
+    #[test]
+    fn resume_with_pg_setup_runs_init_pg_after_reset() {
+        let mmio = Mmio::new(FakeBar::new(BAR_WORDS));
+        let firmware = UcodeFirmware {
+            version: 0x11E,
+            feature_version: 1,
+            words: vec![0xBEEF_0001],
+        };
+        let list = crate::fw::RlcRegisterList {
+            format: vec![0; 14],
+            restore: vec![1, 2],
+            format_start: 0x40,
+            restore_list_size: 1,
+            offsets_start: 0x50,
+        };
+        let csb = [0xC000_4A00u32, 1];
+        let setup = crate::power::PgSetup {
+            csb: &csb,
+            csb_va: 0x412_000,
+            list: &list,
+        };
+        resume(&mmio, &firmware, Some(&setup)).unwrap();
+        let writes = mmio.bar().writes.borrow();
+        let reset_off = writes
+            .iter()
+            .position(|entry| entry.0 == GRBM_SOFT_RESET as usize * 4)
+            .unwrap();
+        let csib_off = writes
+            .iter()
+            .position(|entry| entry.0 == crate::power::RLC_CSIB_ADDR_LO as usize * 4)
+            .unwrap();
+        let ucode_off = writes
+            .iter()
+            .position(|entry| entry.0 == RLC_GPM_UCODE_ADDR as usize * 4)
+            .unwrap();
+        assert!(reset_off < csib_off);
+        assert!(csib_off < ucode_off);
+        assert_eq!(
+            writes[csib_off],
+            (crate::power::RLC_CSIB_ADDR_LO as usize * 4, 0x412_000)
         );
     }
 }

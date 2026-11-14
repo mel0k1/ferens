@@ -2,6 +2,8 @@ pub const MM_INDEX: u32 = 0x0000;
 pub const MM_DATA: u32 = 0x0001;
 pub const CONFIG_MEMSIZE: u32 = 0x150A;
 pub const GRBM_GFX_INDEX: u32 = 0xC200;
+pub const PA_SC_RASTER_CONFIG: u32 = 0xA0D4;
+pub const PA_SC_RASTER_CONFIG_1: u32 = 0xA0D5;
 
 pub const SET_SH_REG_START: u32 = 0x2C00;
 pub const SET_CONTEXT_REG_START: u32 = 0xA000;

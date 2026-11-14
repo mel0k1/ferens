@@ -46,11 +46,14 @@ pub const VM_PAGE_TABLE_DEPTH_MASK: u32 = 0x6;
 pub const VM_RANGE_PROTECTION_FAULT_ENABLE_DEFAULT: u32 = 1 << 4;
 
 pub const PTE_VALID: u64 = 1;
+pub const PTE_SYSTEM: u64 = 1 << 1;
 pub const PTE_SNOOPED: u64 = 1 << 2;
 pub const PTE_EXECUTABLE: u64 = 1 << 4;
 pub const PTE_READABLE: u64 = 1 << 5;
 pub const PTE_WRITEABLE: u64 = 1 << 6;
 pub const PTE_FLAGS: u64 = PTE_VALID | PTE_SNOOPED | PTE_EXECUTABLE | PTE_READABLE | PTE_WRITEABLE;
+pub const PTE_SYSTEM_FLAGS: u64 =
+    PTE_VALID | PTE_SYSTEM | PTE_SNOOPED | PTE_READABLE | PTE_WRITEABLE;
 pub const PTE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 pub const GPU_PAGE_BYTES: u64 = 4096;
@@ -65,6 +68,53 @@ pub struct VmConfig {
 
 pub fn pte_identity_word(page_addr: u64) -> u64 {
     (page_addr & PTE_ADDR_MASK) | PTE_FLAGS
+}
+
+pub fn pte_system_word(host_page_addr: u64) -> u64 {
+    (host_page_addr & PTE_ADDR_MASK) | PTE_SYSTEM_FLAGS
+}
+
+pub fn zero_entries(
+    aperture: &mut MappedBar,
+    table_byte_offset: usize,
+    pages: usize,
+) -> io::Result<()> {
+    let words = aperture.words_mut();
+    let first_word = table_byte_offset / 4;
+    let last_word = first_word + pages * 2;
+    if last_word > words.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "page table does not fit in aperture",
+        ));
+    }
+    for word in &mut words[first_word..last_word] {
+        *word = 0;
+    }
+    Ok(())
+}
+
+pub fn fill_system_entries(
+    aperture: &mut MappedBar,
+    table_byte_offset: usize,
+    first_page_index: u32,
+    pfns: &[u64],
+) -> io::Result<()> {
+    let words = aperture.words_mut();
+    let first_word = table_byte_offset / 4 + (first_page_index as usize) * 2;
+    let last_word = first_word + pfns.len() * 2;
+    if last_word > words.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "page table does not fit in aperture",
+        ));
+    }
+    for (index, pfn) in pfns.iter().enumerate() {
+        let entry = pte_system_word(pfn * GPU_PAGE_BYTES);
+        words[first_word + index * 2] = entry as u32;
+        words[first_word + index * 2 + 1] = (entry >> 32) as u32;
+    }
+    Ok(())
 }
 
 pub fn pte_page_count(start_pfn: u32, end_pfn: u32) -> usize {
@@ -163,6 +213,24 @@ mod tests {
         assert_eq!(
             PTE_FLAGS,
             (1 << 0) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6)
+        );
+    }
+
+    #[test]
+    fn pte_system_marks_host_pages() {
+        let entry = pte_system_word(0x0000_7F3A_BCDE_5000);
+        assert_eq!(entry & PTE_ADDR_MASK, 0x0000_7F3A_BCDE_5000);
+        assert_eq!(entry & PTE_VALID, PTE_VALID);
+        assert_eq!(entry & PTE_SYSTEM, PTE_SYSTEM);
+        assert_eq!(entry & PTE_SNOOPED, PTE_SNOOPED);
+        assert_eq!(entry & PTE_READABLE, PTE_READABLE);
+        assert_eq!(entry & PTE_WRITEABLE, PTE_WRITEABLE);
+        assert_eq!(entry & PTE_EXECUTABLE, 0);
+        let from_pfn = pte_system_word(0x012345 << 12);
+        assert_eq!(from_pfn & PTE_ADDR_MASK, 0x1234_5000);
+        assert_eq!(
+            PTE_SYSTEM_FLAGS,
+            (1 << 0) | (1 << 1) | (1 << 2) | (1 << 5) | (1 << 6)
         );
     }
 

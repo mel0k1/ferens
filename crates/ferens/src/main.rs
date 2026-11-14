@@ -15,7 +15,7 @@ use ferens_gfx8::regs;
 use ferens_kfd::{Allocator, ComputeQueue, Device, GPU_PAGE_BYTES};
 use ferens_mmio::CpQueue;
 
-const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio";
+const USAGE: &str = "usage: ferens list | ferens show <slot> | ferens pm4-dump | ferens dispatch | ferens dispatch-mmio | ferens gate [pg] | ferens dispatch-gtt";
 
 const RING_BYTES: usize = 4096;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -28,6 +28,8 @@ fn main() {
         Some("pm4-dump") => run_pm4_dump(),
         Some("dispatch") => run_dispatch(),
         Some("dispatch-mmio") => run_dispatch_mmio(),
+        Some("gate") => run_gate(args.get(1).map(String::as_str)),
+        Some("dispatch-gtt") => run_dispatch_gtt(),
         _ => eprintln!("{USAGE}"),
     }
 }
@@ -120,6 +122,110 @@ fn run_dispatch_mmio() {
     if let Err(error) = dispatch_mmio_live() {
         eprintln!("dispatch-mmio failed: {error}");
     }
+}
+
+fn run_gate(arg: Option<&str>) {
+    if let Err(error) = gate_live(arg == Some("pg")) {
+        eprintln!("gate failed: {error}");
+    }
+}
+
+fn run_dispatch_gtt() {
+    if let Err(error) = dispatch_gtt_live() {
+        eprintln!("dispatch-gtt failed: {error}");
+    }
+}
+
+fn gate_live(with_pg: bool) -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let mut queue = CpQueue::create(&slot_dir, device.chip)?;
+    println!(
+        "mec fw 0x{:08x}, rlc fw 0x{:08x}, mec2 {}, csb+srm {}",
+        queue.mec_fw_version, queue.rlc_fw_version, queue.mec2_loaded, queue.pg_initialized
+    );
+    println!(
+        "before: cg ctrl {:#010x}, pg cntl {:#010x}",
+        queue.read_reg(ferens_mmio::RLC_CGCG_CGLS_CTRL),
+        queue.read_reg(ferens_mmio::RLC_PG_CNTL)
+    );
+    queue.enable_cg();
+    if with_pg {
+        queue.enable_pg();
+    }
+    println!(
+        "after:  cg ctrl {:#010x}, pg cntl {:#010x}",
+        queue.read_reg(ferens_mmio::RLC_CGCG_CGLS_CTRL),
+        queue.read_reg(ferens_mmio::RLC_PG_CNTL)
+    );
+    queue.destroy()?;
+    Ok(())
+}
+
+fn dispatch_gtt_live() -> io::Result<()> {
+    let device = ferens_mmio::find_polaris()?;
+    println!(
+        "{} 0x{:04x} {} rev 0x{:02x}",
+        device.slot,
+        device.device_id,
+        device.chip.name(),
+        device.revision
+    );
+    let slot_dir = Path::new(SYSFS_PCI_DEVICES).join(&device.slot);
+    let mut queue = CpQueue::create(&slot_dir, device.chip)?;
+    println!(
+        "mec fw 0x{:08x}, rlc fw 0x{:08x}, mec2 {}, csb+srm {}",
+        queue.mec_fw_version, queue.rlc_fw_version, queue.mec2_loaded, queue.pg_initialized
+    );
+    queue.load_kernel(&isa::KERNEL_WORDS)?;
+    let buffer = queue.alloc_gtt(1)?;
+    println!("gtt page mapped at va {:#x}", buffer.va);
+    let plan = DispatchPlan {
+        kernel_va: ferens_mmio::KERNEL_OFFSET,
+        kernarg_va: buffer.va + KERNARG_OFFSET as u64,
+        fence_va: buffer.va + FENCE_OFFSET as u64,
+        output_va: buffer.va + OUTPUT_OFFSET as u64,
+        grid: [1, 1, 1],
+        group: [64, 1, 1],
+    };
+    let descriptor = isa::buffer_descriptor(plan.output_va, 0, 4);
+    for (index, word) in descriptor.iter().enumerate() {
+        buffer.host.write_u32(KERNARG_OFFSET + index * 4, *word);
+    }
+    buffer.host.write_u32(FENCE_OFFSET, 0);
+    let stream = ferens_mmio::dispatch_stream_va([1, 1, 1], [64, 1, 1], buffer.va);
+    println!("stream {} dwords", stream.len());
+    queue.submit(&stream)?;
+
+    let started = Instant::now();
+    let mut fence = buffer.host.read_u32(FENCE_OFFSET);
+    while fence != FENCE_MAGIC && started.elapsed() < FENCE_TIMEOUT {
+        thread::sleep(Duration::from_millis(1));
+        fence = buffer.host.read_u32(FENCE_OFFSET);
+    }
+    if fence != FENCE_MAGIC {
+        queue.destroy()?;
+        return Err(io::Error::other(format!(
+            "fence timeout after {}ms, rptr report {} dwords",
+            started.elapsed().as_millis(),
+            queue.read_pointer_dw()
+        )));
+    }
+    println!("fence {fence:#x} after {}ms", started.elapsed().as_millis());
+    println!(
+        "data[0] {:#010x}, kernel writes {:#010x} (cpu polled its own memory, no BAR read)",
+        buffer.host.read_u32(OUTPUT_OFFSET),
+        isa::KERNEL_MAGIC
+    );
+    queue.destroy()?;
+    Ok(())
 }
 
 fn dispatch_mmio_live() -> io::Result<()> {

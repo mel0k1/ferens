@@ -1,11 +1,14 @@
 pub const NOP: u8 = 0x10;
+pub const CLEAR_STATE: u8 = 0x12;
 pub const DISPATCH_DIRECT: u8 = 0x15;
 pub const DISPATCH_INDIRECT: u8 = 0x16;
+pub const CONTEXT_CONTROL: u8 = 0x28;
 pub const INDIRECT_BUFFER_CONST: u8 = 0x33;
 pub const WRITE_DATA: u8 = 0x37;
 pub const WAIT_REG_MEM: u8 = 0x3C;
 pub const INDIRECT_BUFFER: u8 = 0x3F;
 pub const EVENT_WRITE: u8 = 0x46;
+pub const PREAMBLE_CNTL: u8 = 0x4A;
 pub const SET_CONTEXT_REG: u8 = 0x69;
 pub const SET_SH_REG: u8 = 0x76;
 
